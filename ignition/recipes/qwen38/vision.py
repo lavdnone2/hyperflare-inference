@@ -105,7 +105,7 @@ class VisionWeights:
                     reg = host_allocator(name, tuple(tensor.shape), tensor.dtype)
                 else:
                     reg = MappedHostAllocation(tuple(tensor.shape), tensor.dtype, tensor.device)
-                reg.host_view.view(torch.uint8).reshape(-1).copy_(tensor.view(torch.uint8).reshape(-1).cpu())
+                reg.host_view.reshape(-1).view(torch.uint8).copy_(tensor.reshape(-1).view(torch.uint8).cpu())
                 allocs.append(reg)
                 return reg.device_view
             # Preserve exact swizzled strides (e.g. F8_128x4 scale_mma) by copying the flat span.
@@ -119,19 +119,19 @@ class VisionWeights:
                 reg = host_allocator(name, (span,), tensor.dtype)
             else:
                 reg = MappedHostAllocation((span,), tensor.dtype, tensor.device)
-            reg.host_view.view(torch.uint8).copy_(flat_src.view(torch.uint8).cpu())
+            reg.host_view.reshape(-1).view(torch.uint8).copy_(flat_src.reshape(-1).view(torch.uint8).cpu())
             allocs.append(reg)
             return reg.device_view.as_strided(shape, stride)
 
         def move_weight(prefix: str, obj):
             if isinstance(obj, torch.Tensor):
                 return move_tensor(prefix, obj)
-            if is_dataclass(obj):
+            if is_dataclass(obj) and not isinstance(obj, type):
                 updates = {}
                 for f in fields(obj):
                     val = getattr(obj, f.name)
-                    if isinstance(val, torch.Tensor):
-                        updates[f.name] = move_tensor(f"{prefix}.{f.name}", val)
+                    if isinstance(val, torch.Tensor) or (is_dataclass(val) and not isinstance(val, type)):
+                        updates[f.name] = move_weight(f"{prefix}.{f.name}", val)
                 return replace(obj, **updates) if updates else obj
             return obj
 
