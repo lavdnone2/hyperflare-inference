@@ -158,7 +158,9 @@ def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persis
         available = (available - max(_HEADROOM_BYTES, headroom_bytes)) // pools
     else:
         available -= headroom_bytes
-    return max(0, available - _TUNING_GROWTH_BYTES - pending_persistent_bytes)
+    props = torch.cuda.get_device_properties(device)
+    growth = (_TUNING_GROWTH_BYTES // 2) if (not props.is_integrated and props.total_memory <= (20 << 30)) else _TUNING_GROWTH_BYTES
+    return max(0, available - growth - pending_persistent_bytes)
 
 
 def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None):
@@ -167,9 +169,11 @@ def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=Non
 
     if not torch.cuda.get_device_properties(device).is_integrated:
         free = device_memory_info(device)[0]
+        props = torch.cuda.get_device_properties(device)
+        growth = (_TUNING_GROWTH_BYTES // 2) if props.total_memory <= (20 << 30) else _TUNING_GROWTH_BYTES
         # Candidate fixtures and loaded modules grow after reserving the kernel scratch arena.
         # Bound each device independently; compiler processes still share the host RAM budget.
-        usable = free - headroom_bytes - _TUNING_GROWTH_BYTES
+        usable = free - headroom_bytes - growth
         race = max(1, usable // 4)
         if race_budget is not None:
             race = min(race, race_budget)

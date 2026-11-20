@@ -404,7 +404,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    "embed_in_ram": config.embed_in_ram,
                    "speculative_method": config.speculative_method,
                    "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization},
-        headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
+        headroom_bytes=(0 if config.expert_slots is not None else config.headroom_bytes),
+        benchmark_storage=core_storage)
     session.__enter__()
     graphs = {}
     try:
@@ -491,8 +492,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 stage.update(advance=1)
 
             vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
+            vision_root = VisionScratch.allocate(16384, device)
             for capacity in (16384, 4096, 1024, 256):
-                s = vision_scratch[capacity] = VisionScratch.allocate(capacity, device)
+                s = vision_scratch[capacity] = vision_root.rows(capacity)
                 handoff = PreparedVisionHandoff(vision_inputs, features, requests, s.output, completion, frame, sequence,
                                                pixels=s.patches)
                 handoff.prepare()
@@ -616,10 +618,15 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         if config.mixed_shapes and speculation is None:
             mixed_owner.scratch = mixed_owner.sampling_workspace = None
         session.register_scratch(workspaces)
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        _free, _total = device_memory_info(device)
+        report(f"VRAM before session.tune(): {_free / (1 << 30):.2f} GiB free / {_total / (1 << 30):.2f} GiB")
         with phase(progress, "Prepare and tune kernels") as stage, transient:
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
         workspaces.release_preparation()
-        scratch = s = None
+        scratch = s = vision_root = None
         vision_scratch.clear()
         if config.mixed_shapes:
             owners.remove(mixed_scratch)
