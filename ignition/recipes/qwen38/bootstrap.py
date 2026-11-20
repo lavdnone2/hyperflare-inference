@@ -311,58 +311,62 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     torch.cuda.set_device(device)
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_qwen38_checkpoint(snapshot)
-    # Loading, construction and tuning free most of what they allocate; a transient core pool returns
+    # Loading frees large temporary staging buffers (especially tiered 512-expert batches);
+    # closing a dedicated load transient pool returns those segments to CUDA immediately before
+    # collectives, scratch, and kernel tuning.
+    host_allocator = None if core_storage is None else core_storage.host_allocate
+    with (contextlib.nullcontext() if core_storage is None else core_storage.transient()):
+        weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
+            shard_hyperconnections=config.shard_hyperconnections,
+            force_moe_decode_a16=config.force_moe_decode_a16,
+            expert_slots=config.expert_slots,
+            vision_in_ram=config.vision_in_ram,
+            embed_in_ram=config.embed_in_ram,
+            host_allocator=host_allocator)
+        if torch.cuda.get_device_properties(device).is_integrated:
+            from ignition.preparation.host_memory import release_page_cache
+
+            release_page_cache(manifest.shard_paths)
+        mtp_weights = None
+        has_mtp = config.mtp and config.speculative_method == "mtp"
+        has_dflash = config.mtp and config.speculative_method == "dflash2"
+        draft_config = draft_weights = draft_head = draft_embedding = None
+        if has_mtp:
+            from .mtp_weights import MTPWeights
+
+            mtp_weights = MTPWeights.load(manifest, device,
+                embedding_weight=weights.tree.model.language_model.embed_tokens.weight,
+                lm_head_weight=weights.tree.lm_head.weight, progress=progress, shard=shard,
+                shard_hyperconnections=config.shard_hyperconnections)
+        if has_dflash:
+            from .draft_config import load as load_draft_config
+            from ignition.components.dflash2_weights import DraftWeights
+
+            draft_config = load_draft_config(config.draft_snapshot)
+            draft_weights = DraftWeights.load(config.draft_snapshot, draft_config, device, shard,
+                                              progress=progress, online_mxfp8=config.online_mxfp8)
+            from .dflash import draft_embedding as rank_draft_embedding
+
+            draft_embedding = rank_draft_embedding(
+                weights.tree.model.language_model.embed_tokens.weight,
+                shard,
+                embed_in_ram=config.embed_in_ram,
+                host_allocator=host_allocator,
+            )
+            if config.draft_head_quantization is not None:
+                from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
+
+                head = weights.tree.lm_head.weight
+                if head.dtype != torch.bfloat16:
+                    raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
+                converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
+                draft_head = converters[config.draft_head_quantization](head)
+    _free, _total = device_memory_info(device)
+    report(f"VRAM after weights+draft (load pool closed): {weights.allocated_bytes / (1 << 30):.2f} GiB target, {_free / (1 << 30):.2f} GiB free / {_total / (1 << 30):.2f} GiB")
+    # Construction and tuning free most of what they allocate; a transient core pool returns
     # that memory to the device once tuning completes, before compiled forwards are bound.
     if core_storage is not None:
         transient.enter_context(core_storage.transient())
-    host_allocator = None if core_storage is None else core_storage.host_allocate
-    weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
-        shard_hyperconnections=config.shard_hyperconnections,
-        force_moe_decode_a16=config.force_moe_decode_a16,
-        expert_slots=config.expert_slots,
-        vision_in_ram=config.vision_in_ram,
-        embed_in_ram=config.embed_in_ram,
-        host_allocator=host_allocator)
-    _free, _total = device_memory_info(device)
-    report(f"VRAM after target weights: {weights.allocated_bytes / (1 << 30):.2f} GiB weights, {_free / (1 << 30):.2f} GiB free / {_total / (1 << 30):.2f} GiB")
-    if torch.cuda.get_device_properties(device).is_integrated:
-        from ignition.preparation.host_memory import release_page_cache
-
-        release_page_cache(manifest.shard_paths)
-    mtp_weights = None
-    has_mtp = config.mtp and config.speculative_method == "mtp"
-    has_dflash = config.mtp and config.speculative_method == "dflash2"
-    draft_config = draft_weights = draft_head = draft_embedding = None
-    if has_mtp:
-        from .mtp_weights import MTPWeights
-
-        mtp_weights = MTPWeights.load(manifest, device,
-            embedding_weight=weights.tree.model.language_model.embed_tokens.weight,
-            lm_head_weight=weights.tree.lm_head.weight, progress=progress, shard=shard,
-            shard_hyperconnections=config.shard_hyperconnections)
-    if has_dflash:
-        from .draft_config import load as load_draft_config
-        from ignition.components.dflash2_weights import DraftWeights
-
-        draft_config = load_draft_config(config.draft_snapshot)
-        draft_weights = DraftWeights.load(config.draft_snapshot, draft_config, device, shard,
-                                          progress=progress, online_mxfp8=config.online_mxfp8)
-        from .dflash import draft_embedding as rank_draft_embedding
-
-        draft_embedding = rank_draft_embedding(
-            weights.tree.model.language_model.embed_tokens.weight,
-            shard,
-            embed_in_ram=config.embed_in_ram,
-            host_allocator=host_allocator,
-        )
-        if config.draft_head_quantization is not None:
-            from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
-
-            head = weights.tree.lm_head.weight
-            if head.dtype != torch.bfloat16:
-                raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
-            converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
-            draft_head = converters[config.draft_head_quantization](head)
     host_storage = {} if core_storage is None else {"host_allocator": core_storage.host_allocate}
     table = PLETable.load(manifest, device, tokens=config.token_capacity, progress=progress, **host_storage)
     sample_rows = max(batch * width for batch, width in config.speculative_shapes) if config.mtp else config.request_capacity
