@@ -68,12 +68,17 @@ class ModelWeights:
     vision: VisionWeights
     allocated_bytes: int
     shard: TensorParallelShard = TensorParallelShard(0, 1)
+    prefill_staging_experts: object | None = None
 
     @classmethod
     def load(cls, manifest: CheckpointManifest, device: torch.device,
              *, progress: Callable[[str], None] | None = None,
              shard: TensorParallelShard = TensorParallelShard(0, 1),
-             shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False) -> ModelWeights:
+             shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False,
+             expert_slots=None, vision_in_ram: bool = False, embed_in_ram: bool = False,
+             host_allocator=None) -> ModelWeights:
+        from .weights import _suspend_persistent_storage, load_expert_slots_config
+
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("model weights require a CUDA device")
@@ -82,15 +87,25 @@ class ModelWeights:
             raise ValueError(f"the Qwen recipe requires {SUPPORTED_ARCHITECTURES}")
         if force_moe_decode_a16 and torch.cuda.get_device_capability(device) not in ((12, 0), (12, 1)):
             raise ValueError("force_moe_decode_a16 requires SM120/121 packed NVFP4 experts")
+        slots_cfg = None if expert_slots is None else load_expert_slots_config(expert_slots)
         free_bytes, _ = device_memory_info(device)
         stored = sum(tensor.nbytes for tensor in manifest.tensors.values()
                      if tensor.component not in ("mtp", "ple_tables"))
-        # Additional layouts, state, graph memory, and cache pages are planned separately.
-        if free_bytes < stored // shard.world_size + (8 << 30):
-            raise MemoryError(f"model weight loading requires at least {stored // shard.world_size + (8 << 30)} free CUDA bytes; found {free_bytes}")
+        if slots_cfg is None:
+            # Additional layouts, state, graph memory, and cache pages are planned separately.
+            if free_bytes < stored // shard.world_size + (8 << 30):
+                raise MemoryError(f"model weight loading requires at least {stored // shard.world_size + (8 << 30)} free CUDA bytes; found {free_bytes}")
+        else:
+            est_expert_bytes = slots_cfg.total_slots * (2_764_800 // shard.world_size) + 64 * (2_764_800 // shard.world_size)
+            est_other_bytes = (4 << 30) - ((1 << 30) if embed_in_ram else 0) - ((300 << 20) if vision_in_ram else 0)
+            min_need = est_expert_bytes + max(0, est_other_bytes) + (1 << 30)
+            if free_bytes < min_need:
+                raise MemoryError(f"tiered Qwen weight loading requires at least {min_need} free CUDA bytes; found {free_bytes}")
         tree = create_model_tree(manifest)
         before = allocated_tensor_bytes(device)
         layers = []
+        prefill_staging_experts = None
+        embed_host_alloc = None
         with QwenWeightLoader(manifest, device, progress=progress, shard=shard,
                               force_moe_decode_a16=force_moe_decode_a16) as loader:
             def parameters(paths, extents=None, *, temporary=False):
@@ -112,8 +127,24 @@ class ModelWeights:
                                    tuple(extents.get(f"{name}.weight") for name in selected), temporary=temporary)
                 packed_down_projection(tree.get_submodule(prefix))
 
-            parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
-                       (None, slice(*shard.partition(248320))))
+            if embed_in_ram:
+                from b12x.sequence._shared.disk_table import MappedHostAllocation
+
+                with _suspend_persistent_storage():
+                    raw_emb = loader.load_tensors((f"{TEXT_PREFIX}.embed_tokens.weight",))[0]
+                    if host_allocator is not None:
+                        embed_host_alloc = host_allocator("embed_tokens.weight", tuple(raw_emb.shape), raw_emb.dtype)
+                    else:
+                        embed_host_alloc = MappedHostAllocation(tuple(raw_emb.shape), raw_emb.dtype, device)
+                    embed_host_alloc.host_view.copy_(raw_emb.cpu())
+                    del raw_emb
+                torch.cuda.empty_cache()
+                tree.get_submodule(f"{TEXT_PREFIX}.embed_tokens").weight = torch.nn.Parameter(
+                    embed_host_alloc.device_view, requires_grad=False)
+                parameters(("lm_head.weight",), (slice(*shard.partition(248320)),))
+            else:
+                parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
+                           (None, slice(*shard.partition(248320))))
             hyperconnection(f"{TEXT_PREFIX}.hyper_connection_mixer")
             for layer in range(48):
                 prefix = f"{TEXT_PREFIX}.layers.{layer}"
@@ -145,20 +176,44 @@ class ModelWeights:
                     module.num_v_heads //= shard.world_size
                     module.conv_dim //= shard.world_size
                 attention = load_projections(attention_prefix)
-                moe = QwenMoeWeights.load(loader, layer)
+                if slots_cfg is not None:
+                    moe = QwenMoeWeights.load(
+                        loader,
+                        layer,
+                        num_slots=slots_cfg.slots[layer],
+                        initial_experts=slots_cfg.initial_experts[layer],
+                        host_allocator=host_allocator,
+                    )
+                else:
+                    moe = QwenMoeWeights.load(loader, layer)
                 module = tree.get_submodule(f"{prefix}.mlp")
                 module.gate.weight = torch.nn.Parameter(moe.router, requires_grad=False)
                 module.shared_expert_gate.weight = torch.nn.Parameter(moe.shared.gate, requires_grad=False)
                 layers.append(DecoderLayerWeights(attention, moe))
+            if slots_cfg is not None:
+                prefill_staging_experts = loader.allocate_prefill_staging_experts(staging_slots=64)
 
             prefix = f"{TEXT_PREFIX}.layers.1.ple"
             parameters(tuple(f"{prefix}.{name}" for name in
                 ("key_proj.weight", "value_proj.weight", "conv1d.weight", "norm_key.weight",
                  "norm_query.weight", "norm_conv.weight")))
-            vision = VisionWeights.load(tree.model.visual, loader)
+            vision = VisionWeights.load(tree.model.visual, loader, vision_in_ram=vision_in_ram,
+                                        host_allocator=host_allocator)
+        if embed_host_alloc is not None:
+            tree._embed_host_alloc = embed_host_alloc
         torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
         return cls(tree, tuple(layers), vision,
-                   allocated_tensor_bytes(device) - before, shard)
+                   allocated_tensor_bytes(device) - before, shard,
+                   prefill_staging_experts=prefill_staging_experts)
+
+    def reset_expert_caches(self) -> None:
+        """Restore initial SLRU residency, weights, and zeroed stats for all tiered MoE layers."""
+        for layer in self.layers:
+            tiered = layer.moe.tiered
+            if tiered is not None:
+                tiered.cache_state.reset_to_initial()
+                tiered.cache_state.copy_initial_weights(tiered.bulk_planes, tiered.scalar_planes)
 
 
 @dataclass(frozen=True)
@@ -296,7 +351,8 @@ class PreparedDecoder:
                     partitions=getattr(state, "gdn_partitions", None))
             moe = PreparedQwenMoe(source, layer_weights.moe, session=session, name=f"{prefix}.moe",
                 scratch=scratch.moe, workspace=workspaces,
-                projection_workspace=workspaces, prefill=state.mode == "prefill")
+                projection_workspace=workspaces, prefill=state.mode == "prefill",
+                prefill_staging_experts=weights.prefill_staging_experts)
             self.layers.append((attn_hc, attention, mlp_hc, moe))
             if runtime is not None:
                 from ignition.components.collectives import PreparedAllReduce

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
 from b12x.preparation import PreparationSession
@@ -76,20 +76,84 @@ class VisionScratch:
 class VisionWeights:
     parameters: dict[str, torch.Tensor]
     projections: dict[str, object]
+    host_allocations: tuple[object, ...] = ()
 
     @classmethod
-    def load(cls, module, loader) -> VisionWeights:
+    def load(cls, module, loader, *, vision_in_ram: bool = False, host_allocator=None) -> VisionWeights:
+        from .weights import _suspend_persistent_storage
+
         paths, projections = [], {}
-        for path, _ in module.named_parameters():
-            projection = path.removesuffix(".weight")
-            quantized = (path.endswith(".weight") and not path.startswith("patch_embed.")
-                         and path.split(".")[-2] in ("qkv", "proj", "linear_fc1", "linear_fc2"))
-            if quantized:
-                projections[projection] = loader.load_linear(f"model.visual.{projection}")
+        if not vision_in_ram:
+            for path, _ in module.named_parameters():
+                projection = path.removesuffix(".weight")
+                quantized = (path.endswith(".weight") and not path.startswith("patch_embed.")
+                             and path.split(".")[-2] in ("qkv", "proj", "linear_fc1", "linear_fc2"))
+                if quantized:
+                    projections[projection] = loader.load_linear(f"model.visual.{projection}")
+                else:
+                    paths.append(path)
+            parameters = dict(zip(paths, loader.load_tensors(tuple(f"model.visual.{path}" for path in paths)), strict=True))
+            return cls(parameters, projections)
+
+        from b12x.sequence._shared.disk_table import MappedHostAllocation
+
+        allocs: list[object] = []
+
+        def move_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.is_contiguous():
+                if host_allocator is not None:
+                    reg = host_allocator(name, tuple(tensor.shape), tensor.dtype)
+                else:
+                    reg = MappedHostAllocation(tuple(tensor.shape), tensor.dtype, tensor.device)
+                reg.host_view.view(torch.uint8).reshape(-1).copy_(tensor.view(torch.uint8).reshape(-1).cpu())
+                allocs.append(reg)
+                return reg.device_view
+            # Preserve exact swizzled strides (e.g. F8_128x4 scale_mma) by copying the flat span.
+            shape = tuple(tensor.shape)
+            stride = tuple(tensor.stride())
+            span = 1 + sum((sz - 1) * st for sz, st in zip(shape, stride, strict=True) if sz > 0)
+            flat_src = torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+                tensor.untyped_storage(), tensor.storage_offset(), (span,), (1,)
+            )
+            if host_allocator is not None:
+                reg = host_allocator(name, (span,), tensor.dtype)
             else:
-                paths.append(path)
-        parameters = dict(zip(paths, loader.load_tensors(tuple(f"model.visual.{path}" for path in paths)), strict=True))
-        return cls(parameters, projections)
+                reg = MappedHostAllocation((span,), tensor.dtype, tensor.device)
+            reg.host_view.view(torch.uint8).copy_(flat_src.view(torch.uint8).cpu())
+            allocs.append(reg)
+            return reg.device_view.as_strided(shape, stride)
+
+        def move_weight(prefix: str, obj):
+            if isinstance(obj, torch.Tensor):
+                return move_tensor(prefix, obj)
+            if is_dataclass(obj):
+                updates = {}
+                for f in fields(obj):
+                    val = getattr(obj, f.name)
+                    if isinstance(val, torch.Tensor):
+                        updates[f.name] = move_tensor(f"{prefix}.{f.name}", val)
+                return replace(obj, **updates) if updates else obj
+            return obj
+
+        with _suspend_persistent_storage():
+            for path, _ in module.named_parameters():
+                projection = path.removesuffix(".weight")
+                quantized = (path.endswith(".weight") and not path.startswith("patch_embed.")
+                             and path.split(".")[-2] in ("qkv", "proj", "linear_fc1", "linear_fc2"))
+                if quantized:
+                    w = loader.load_linear(f"model.visual.{projection}")
+                    projections[projection] = move_weight(f"vision.{projection}", w)
+                    del w
+                else:
+                    paths.append(path)
+            raw_params = loader.load_tensors(tuple(f"model.visual.{path}" for path in paths))
+            parameters = {
+                path: move_tensor(f"vision.{path}", tensor)
+                for path, tensor in zip(paths, raw_params, strict=True)
+            }
+            del raw_params
+        torch.cuda.empty_cache()
+        return cls(parameters, projections, host_allocations=tuple(allocs))
 
 
 class _Linear(torch.nn.Module):

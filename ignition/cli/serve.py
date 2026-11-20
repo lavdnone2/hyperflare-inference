@@ -201,7 +201,9 @@ def _export_hosts(args):
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,
                          language_model_only=args.language_model_only,
-                         mla_compute_mode=args.mla_compute_mode)
+                         mla_compute_mode=args.mla_compute_mode,
+                         expert_slots=args.expert_slots, vision_in_ram=args.vision_in_ram,
+                         embed_in_ram=args.embed_in_ram, shard_hyperconnections=args.shard_hyperconnections)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
@@ -277,6 +279,8 @@ def _prepare(args):
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
+                      expert_slots=args.expert_slots, vision_in_ram=args.vision_in_ram,
+                      embed_in_ram=args.embed_in_ram,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), context_parallel_size=getattr(args, "dcp_size", None),
@@ -314,7 +318,10 @@ def _prepare(args):
                      f"{' · MoE decode A16 / prefill A4' if plan.force_moe_decode_a16 else ''}"
                      f"{' · DFlash2 proposals' if plan.speculation is not None and plan.speculation.method == 'dflash2' else ''}"
                      f"{' · joint tuning' if plan.joint_tuning else ''}"
-                     f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}")
+                     f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}"
+                     f"{(' · tiered SLRU experts ' + str(plan.expert_slots)) if plan.expert_slots is not None else ''}"
+                     f"{' · vision in RAM' if plan.vision_in_ram else ''}"
+                     f"{' · embed in RAM' if plan.embed_in_ram else ''}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -468,7 +475,9 @@ def debug_serve(args) -> int:
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs, parallax_routing=args.parallax_routing,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          online_mxfp8_scope=args.online_mxfp8_scope,
-                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
+                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
+                         expert_slots=args.expert_slots, vision_in_ram=args.vision_in_ram,
+                         embed_in_ram=args.embed_in_ram, shard_hyperconnections=args.shard_hyperconnections)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),

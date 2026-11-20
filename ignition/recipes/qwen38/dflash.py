@@ -38,7 +38,7 @@ class CaptureMetadata:
     query_start_loc: torch.Tensor
 
 
-def draft_embedding(embedding, shard):
+def draft_embedding(embedding, shard, *, embed_in_ram: bool = False, host_allocator=None):
     """Return this rank's draft embedding columns in storage that starts at offset zero.
 
     Tensor-parallel ranks bind one compiled forward whose input bindings include storage
@@ -47,6 +47,21 @@ def draft_embedding(embedding, shard):
     target table directly.
     """
     first, last = shard.partition(embedding.shape[1], alignment=64)
+    if embed_in_ram and shard.world_size > 1:
+        from b12x.sequence._shared.disk_table import MappedHostAllocation
+        from .weights import _suspend_persistent_storage
+
+        shape = (embedding.shape[0], last - first)
+        with _suspend_persistent_storage():
+            if host_allocator is not None:
+                reg = host_allocator("draft_embedding.weight", shape, embedding.dtype)
+            else:
+                reg = MappedHostAllocation(shape, embedding.dtype, embedding.device)
+            reg.host_view.copy_(embedding[:, first:last].cpu())
+        torch.cuda.empty_cache()
+        view = reg.device_view
+        view._host_alloc = reg
+        return view
     return embedding[:, first:last].contiguous()
 
 

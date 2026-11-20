@@ -166,6 +166,7 @@ def run(args):
         lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
         force_moe_decode_a16=args.force_moe_decode_a16,
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
+        expert_slots=args.expert_slots, vision_in_ram=args.vision_in_ram, embed_in_ram=args.embed_in_ram,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, parallax_routing=args.parallax_routing, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, online_mxfp8_scope=args.online_mxfp8_scope,

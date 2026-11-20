@@ -108,6 +108,9 @@ class PreparationConfig:
     # on an auxiliary stream; without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
     shard_hyperconnections: bool = False
+    expert_slots: str | int | None = None
+    vision_in_ram: bool = False
+    embed_in_ram: bool = False
     mtp_only: bool = False
 
     def __post_init__(self):
@@ -243,7 +246,10 @@ def _identity(manifest, world_size=1, *, config=None, draft_config=None):
     if config is not None:
         value["arithmetic"] = dict(native_dense_activations=config.native_dense_activations,
             force_moe_decode_a16=config.force_moe_decode_a16,
-            shard_hyperconnections=config.shard_hyperconnections)
+            shard_hyperconnections=config.shard_hyperconnections,
+            expert_slots=str(config.expert_slots) if config.expert_slots is not None else None,
+            vision_in_ram=config.vision_in_ram,
+            embed_in_ram=config.embed_in_ram)
         value["draft"] = None
         if config.mtp:
             value["draft"] = dict(method=config.speculative_method,
@@ -309,9 +315,14 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     # that memory to the device once tuning completes, before compiled forwards are bound.
     if core_storage is not None:
         transient.enter_context(core_storage.transient())
+    host_allocator = None if core_storage is None else core_storage.host_allocate
     weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
         shard_hyperconnections=config.shard_hyperconnections,
-        force_moe_decode_a16=config.force_moe_decode_a16)
+        force_moe_decode_a16=config.force_moe_decode_a16,
+        expert_slots=config.expert_slots,
+        vision_in_ram=config.vision_in_ram,
+        embed_in_ram=config.embed_in_ram,
+        host_allocator=host_allocator)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -336,7 +347,12 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                                           progress=progress, online_mxfp8=config.online_mxfp8)
         from .dflash import draft_embedding as rank_draft_embedding
 
-        draft_embedding = rank_draft_embedding(weights.tree.model.language_model.embed_tokens.weight, shard)
+        draft_embedding = rank_draft_embedding(
+            weights.tree.model.language_model.embed_tokens.weight,
+            shard,
+            embed_in_ram=config.embed_in_ram,
+            host_allocator=host_allocator,
+        )
         if config.draft_head_quantization is not None:
             from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 
@@ -379,6 +395,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,
                    "shard_hyperconnections": config.shard_hyperconnections,
                    "force_moe_decode_a16": config.force_moe_decode_a16,
+                   "expert_slots": str(config.expert_slots) if config.expert_slots is not None else None,
+                   "vision_in_ram": config.vision_in_ram,
+                   "embed_in_ram": config.embed_in_ram,
                    "speculative_method": config.speculative_method,
                    "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization},
         headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
@@ -654,6 +673,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 state.memory_capacity[1] = page_capacity
 
         capture_catalog(compile_decoder=compile_decoder, materialize=materialize_cache)
+        weights.reset_expert_caches()
         session.freeze()
         free, total = device_memory_info(device)
         memory = {"weights_bytes": weights.allocated_bytes, "ngram_request_bytes": table.mailbox.host_view.nbytes,
@@ -704,11 +724,11 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_fixed_width=config.speculative_fixed_width)
         resources = (scoring, weights, table, session, state, requests, inputs, workspaces, rotary,
             cache, final_cache, admission, transfer, features, vision_inputs,
-            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, vocabulary_collective, hidden_gather_collective, coordinator)
+            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_embedding, draft_config, collective, vocabulary_collective, hidden_gather_collective, coordinator)
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
         from .export import disposable_ranges
 
-        export_zero_ranges = disposable_ranges(cache=final_cache)
+        export_zero_ranges = disposable_ranges(cache=final_cache, staging_experts=weights.prefill_staging_experts)
         return PreparedModel(rebuild_weights=declare_weights({'weights': weights, 'mtp': mtp_weights, 'draft': draft_weights, 'draft_head': draft_head}, components={
         'tree.model.language_model.embed_tokens': 'embedding',
         'tree.model.language_model.hyper_connection_mixer': 'hyper-connection',

@@ -52,6 +52,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False,
+           expert_slots: str | None = None, vision_in_ram: bool = False, embed_in_ram: bool = False,
            force_moe_decode_a16: bool | None = None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     from ignition.preparation.collective_ladder import resolve as resolve_ladder
@@ -66,7 +67,9 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, parallax_routing=parallax_routing, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
-        online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
+        online_mxfp8=online_mxfp8, online_mxfp8_scope=online_mxfp8_scope, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode,
+        expert_slots=expert_slots, vision_in_ram=vision_in_ram, embed_in_ram=embed_in_ram,
+        shard_hyperconnections=shard_hyperconnections)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,

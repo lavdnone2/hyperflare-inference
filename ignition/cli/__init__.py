@@ -232,6 +232,13 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--shard-hyperconnections", action="store_true",
                           help="shard Qwen3.8 Flash hyperconnection bottlenecks across TP ranks with"
                                " BF16 gate-logit reduction (default: replicated)")
+    advanced.add_argument("--expert-slots", metavar="N_OR_JSON",
+                          help="Qwen3.8 Flash tiered SLRU expert cache slots per layer (integer or non-uniform"
+                               " JSON profile path; keeps all 512 experts in MappedHost RAM)")
+    advanced.add_argument("--vision-in-ram", action="store_true",
+                          help="keep Qwen3.8 Flash vision encoder weights in MappedHost RAM instead of VRAM")
+    advanced.add_argument("--embed-in-ram", action="store_true",
+                          help="keep Qwen3.8 Flash embed_tokens table in MappedHost RAM instead of VRAM")
     advanced.add_argument("--joint-tuning", action="store_true",
                           help="jointly tune DeepSeek V4.1 attention projection plans across the prepared"
                                " prefill, decode, and speculative shapes (default: off)")

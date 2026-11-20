@@ -13,6 +13,11 @@ from b12x.gemm import blockscaled
 from b12x.moe import fused_moe
 from b12x.preparation import PreparationSession
 
+from ignition.components.expert_cache import (
+    PreparedExpertCache,
+    PreparedPrefillExpertStreamer,
+    collect_expert_planes,
+)
 from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import PreparedMLP
@@ -22,7 +27,7 @@ from ignition.preparation.qwen38 import TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
-from .weights import QwenWeightLoader
+from .weights import QwenWeightLoader, TieredExpertWeights
 
 
 @dataclass(frozen=True)
@@ -51,12 +56,37 @@ class QwenMoeWeights:
     experts: fused_moe.PreparedExperts
     shared: SharedExpertWeights
     experts_a4_prefill: bool = False
+    tiered: TieredExpertWeights | None = None
 
     @classmethod
-    def load(cls, loader: QwenWeightLoader, layer: int, *, scale_scratch=None) -> QwenMoeWeights:
+    def load(
+        cls,
+        loader: QwenWeightLoader,
+        layer: int,
+        *,
+        scale_scratch=None,
+        num_slots: int | None = None,
+        initial_experts=None,
+        host_allocator=None,
+    ) -> QwenMoeWeights:
         shared = SharedExpertWeights.load(loader, layer)
+        router = loader.load_tensor(f"{TEXT_PREFIX}.layers.{layer}.mlp.gate.weight")
+        if num_slots is not None and num_slots < 512:
+            tiered = loader.load_tiered_experts(
+                layer,
+                num_slots=num_slots,
+                initial_experts=initial_experts,
+                host_allocator=host_allocator,
+            )
+            return cls(
+                router,
+                tiered.hbm_experts,
+                shared,
+                experts_a4_prefill=loader.force_moe_decode_a16,
+                tiered=tiered,
+            )
         return cls(
-            loader.load_tensor(f"{TEXT_PREFIX}.layers.{layer}.mlp.gate.weight"),
+            router,
             loader.load_experts(layer, scale_scratch=scale_scratch),
             shared,
             experts_a4_prefill=loader.force_moe_decode_a16,
@@ -168,9 +198,15 @@ class PreparedQwenMoe:
 
     def __init__(self, source, weights: QwenMoeWeights, *, session: PreparationSession, name: str,
                  scratch: QwenMoeScratch | None = None, workspace: ScratchArena | torch.Tensor | None = None,
-                 projection_workspace: ScratchArena | torch.Tensor | None = None, prefill: bool = False):
-        if (weights.experts.num_experts, weights.experts.hidden_size) != (512, 2560):
-            raise ValueError("Qwen MoE requires all 512 experts with hidden size 2560")
+                 projection_workspace: ScratchArena | torch.Tensor | None = None, prefill: bool = False,
+                 prefill_staging_experts=None):
+        tiered = weights.tiered
+        if tiered is None:
+            if (weights.experts.num_experts, weights.experts.hidden_size) != (512, 2560):
+                raise ValueError("Qwen MoE requires all 512 experts with hidden size 2560")
+        else:
+            if weights.experts.hidden_size != 2560 or weights.experts.num_experts != tiered.num_slots:
+                raise ValueError("Tiered Qwen MoE requires hidden size 2560 and S-slot HBM pool")
         if tuple(weights.router.shape) != (512, 2560):
             raise ValueError("Qwen router weight must have geometry [512, 2560]")
         if source.ndim != 2 or source.shape[1] != 2560 or source.dtype != torch.bfloat16:
@@ -188,12 +224,63 @@ class PreparedQwenMoe:
         self.routing = PreparedRouter(self.router_logits, self.router, session=session, name=f"{name}.route_topk")
         self.shared = PreparedSharedExpert(source, weights.shared, session=session, name=f"{name}.shared",
             scratch=scratch.shared, projection_workspace=projection_workspace)
+        self.expert_cache = None
+        self.prefill_streamer = None
+        self.staging_experts = None
+        if tiered is not None:
+            tokens, top_k = source.shape[0], self.router.ids.shape[1]
+            routes = tokens * top_k
+            staging_slots = 0 if prefill_staging_experts is None else prefill_staging_experts.num_experts
+            use_stream = prefill or (routes > tiered.num_slots + staging_slots)
+            if use_stream:
+                if prefill_staging_experts is None:
+                    raise ValueError("tiered wide/prefill MoE requires a shared prefill_staging_experts pool")
+                stg_bulk, stg_sc = collect_expert_planes(prefill_staging_experts, tiered.host_planes)
+                self.prefill_streamer = PreparedPrefillExpertStreamer(
+                    tiered.cache_state,
+                    stg_bulk,
+                    stg_sc,
+                    tokens=tokens,
+                    top_k=top_k,
+                    hidden_size=2560,
+                    staging_slots=staging_slots,
+                )
+                self.staging_experts = PreparedRoutedExperts(
+                    source, prefill_staging_experts, self.router.ids, self.router.weights, self.routed_output,
+                    session=session, name=f"{name}.experts_staging", workspace=workspace,
+                    router_plan=self.routing.plan, a4_prefill=prefill and weights.experts_a4_prefill,
+                )
+            elif routes > tiered.num_slots:
+                stg_bulk, stg_sc = collect_expert_planes(prefill_staging_experts, tiered.host_planes)
+                self.expert_cache = PreparedExpertCache(
+                    tiered.cache_state,
+                    tiered.bulk_planes,
+                    tiered.scalar_planes,
+                    tokens=tokens,
+                    top_k=top_k,
+                    staging_bulk_planes=stg_bulk,
+                    staging_scalar_planes=stg_sc,
+                    staging_slots=staging_slots,
+                )
+                self.staging_experts = PreparedRoutedExperts(
+                    source, prefill_staging_experts, self.router.ids, self.router.weights, self.routed_output,
+                    session=session, name=f"{name}.experts_overflow", workspace=workspace,
+                    router_plan=self.routing.plan, a4_prefill=False,
+                )
+            else:
+                self.expert_cache = PreparedExpertCache(
+                    tiered.cache_state,
+                    tiered.bulk_planes,
+                    tiered.scalar_planes,
+                    tokens=tokens,
+                    top_k=top_k,
+                )
         self.experts = PreparedRoutedExperts(source, weights.experts, self.router.ids,
             self.router.weights, self.routed_output, session=session, name=f"{name}.experts", workspace=workspace,
             router_plan=self.routing.plan, a4_prefill=prefill and weights.experts_a4_prefill)
         self.concurrent_shared = None
         if (source.shape[0] <= 256 and isinstance(workspace, ScratchArena) and workspace is projection_workspace
-                and workspace.overlap):
+                and workspace.overlap and self.prefill_streamer is None):
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.router_projection.plan, self.routing.plan, self.experts.plan),
                 gate_projection=self.shared.gate_projection, session=session, workspace=workspace)
@@ -208,6 +295,8 @@ class PreparedQwenMoe:
         self.router_projection.functional(session=session)
         self.routing.functional(session=session)
         self.experts.functional(session=session)
+        if self.staging_experts is not None:
+            self.staging_experts.functional(session=session)
         if self.concurrent_shared is None:
             self.shared.functional(session=session)
         else:
@@ -223,14 +312,32 @@ class PreparedQwenMoe:
             pending = self.concurrent_shared.start(source)
         logits = self.router_projection(source)
         routes = self.routing(logits)
-        if getattr(self.experts, "reduces_into_shared", False):
-            staged = self.experts.stage_rows(source, routes.ids, routes.weights)
+        if self.prefill_streamer is not None:
+            res_ids = torch.empty_like(routes.ids)
+            self.prefill_streamer.map_resident(routes.ids, res_ids)
+            routed = self.experts(source, res_ids, routes.weights)
+            slice_ids = torch.empty_like(routes.ids)
+            for p in range(self.prefill_streamer.num_passes):
+                self.prefill_streamer.stage_slice(p, routes.ids, slice_ids)
+                slice_out = self.staging_experts(source, slice_ids, routes.weights)
+                routed = routed + slice_out
+            return self.shared.finish_runtime(projected, gate, routed)
+        if self.expert_cache is None:
+            route_ids, ovf_ids = routes.ids, None
+        elif self.expert_cache.has_overflow:
+            route_ids, ovf_ids = self.expert_cache(routes.ids)
+        else:
+            route_ids, ovf_ids = self.expert_cache(routes.ids), None
+        if getattr(self.experts, "reduces_into_shared", False) and ovf_ids is None:
+            staged = self.experts.stage_rows(source, route_ids, routes.weights)
             if self.concurrent_shared is not None:
                 projected = self.concurrent_shared.finish(pending, staged.rows)
                 gate = pending.gate
             shared = self.shared.finish_runtime(projected, gate)
             return self.experts.reduce(shared, staged=staged)
-        routed = self.experts(source, routes.ids, routes.weights)
+        routed = self.experts(source, route_ids, routes.weights)
+        if ovf_ids is not None:
+            routed = routed + self.staging_experts(source, ovf_ids, routes.weights)
         if self.concurrent_shared is not None:
             projected = self.concurrent_shared.finish(pending, routed)
             gate = pending.gate
