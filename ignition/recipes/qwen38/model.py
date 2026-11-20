@@ -26,8 +26,9 @@ def create_model_tree(manifest: CheckpointManifest) -> Qwen4ExpForConditionalGen
     """
     distribution = importlib.metadata.distribution("transformers")
     provenance = json.loads(distribution.read_text("direct_url.json") or "{}")
-    if provenance.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION:
-        raise RuntimeError(f"Qwen preparation requires Transformers {TRANSFORMERS_REVISION}")
+    if (provenance.get("vcs_info", {}).get("commit_id") != TRANSFORMERS_REVISION
+            and distribution.version != "5.23.0"):
+        raise RuntimeError(f"Qwen preparation requires Transformers 5.23.0 or {TRANSFORMERS_REVISION}")
     raw = (manifest.snapshot / "config.json").read_bytes()
     if hashlib.sha256(raw).hexdigest() != manifest.metadata_sha256["config.json"]:
         raise CheckpointError("config.json changed after checkpoint inspection")
