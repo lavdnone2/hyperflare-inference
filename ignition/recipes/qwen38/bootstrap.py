@@ -323,6 +323,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         vision_in_ram=config.vision_in_ram,
         embed_in_ram=config.embed_in_ram,
         host_allocator=host_allocator)
+    _free, _total = device_memory_info(device)
+    report(f"VRAM after target weights: {weights.allocated_bytes / (1 << 30):.2f} GiB weights, {_free / (1 << 30):.2f} GiB free / {_total / (1 << 30):.2f} GiB")
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -388,6 +390,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             hidden_gather_collective = create_all_gather_runtime(group, device,
                 max_rows=hidden_rows, columns=2560, ipc=ipc)
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
+    _free, _total = device_memory_info(device)
+    report(f"VRAM after draft+collectives: {_free / (1 << 30):.2f} GiB free / {_total / (1 << 30):.2f} GiB")
     session = preparation_session(
         compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
         native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
