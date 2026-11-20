@@ -235,12 +235,6 @@ def from_plan(model, plan, *, compiled_forwards):
         result['force_moe_decode_a16'] = True
     if plan.shard_hyperconnections:
         result['shard_hyperconnections'] = True
-    if plan.expert_slots is not None:
-        result['expert_slots'] = str(plan.expert_slots)
-    if plan.vision_in_ram:
-        result['vision_in_ram'] = True
-    if plan.embed_in_ram:
-        result['embed_in_ram'] = True
     if plan.joint_tuning:
         result['joint_tuning'] = True
     if (s := plan.speculation) is not None:
