@@ -252,6 +252,85 @@ def _copy_expert_scalars_kernel(
 
 
 @triton.jit
+def _copy_expert_fused_4x4_kernel(
+    d0_ptr, s0_ptr,
+    d1_ptr, s1_ptr,
+    d2_ptr, s2_ptr,
+    d3_ptr, s3_ptr,
+    sd0_ptr, ss0_ptr,
+    sd1_ptr, ss1_ptr,
+    sd2_ptr, ss2_ptr,
+    sd3_ptr, ss3_ptr,
+    miss_src_ptr,
+    miss_dst_ptr,
+    miss_count_ptr,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    R2: tl.constexpr,
+    R3: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    N_SCALARS: tl.constexpr,
+    S_BLOCK: tl.constexpr,
+):
+    """Fused persistent copy of 4 bulk planes + up to 4 scalar planes from MappedHost to HBM."""
+    n_miss = tl.load(miss_count_ptr)
+    if n_miss <= 0:
+        return
+    pid = tl.program_id(0)
+    if pid == 0 and N_SCALARS > 0:
+        soffs = tl.arange(0, S_BLOCK)
+        smask = soffs < n_miss
+        se = tl.load(miss_src_ptr + soffs, mask=smask, other=0).to(tl.int64)
+        ds = tl.load(miss_dst_ptr + soffs, mask=smask, other=0).to(tl.int64)
+        tl.store(sd0_ptr + ds, tl.load(ss0_ptr + se, mask=smask), mask=smask)
+        if N_SCALARS >= 2:
+            tl.store(sd1_ptr + ds, tl.load(ss1_ptr + se, mask=smask), mask=smask)
+        if N_SCALARS >= 3:
+            tl.store(sd2_ptr + ds, tl.load(ss2_ptr + se, mask=smask), mask=smask)
+        if N_SCALARS >= 4:
+            tl.store(sd3_ptr + ds, tl.load(ss3_ptr + se, mask=smask), mask=smask)
+
+    t0: tl.constexpr = (R0 + BLOCK_I32 - 1) // BLOCK_I32
+    t1: tl.constexpr = (R1 + BLOCK_I32 - 1) // BLOCK_I32
+    t2: tl.constexpr = (R2 + BLOCK_I32 - 1) // BLOCK_I32
+    t3: tl.constexpr = (R3 + BLOCK_I32 - 1) // BLOCK_I32
+    t01: tl.constexpr = t0 + t1
+    t012: tl.constexpr = t01 + t2
+    t_tot: tl.constexpr = t012 + t3
+
+    total_tiles = n_miss * t_tot
+    offs = tl.arange(0, BLOCK_I32)
+    t = pid
+    while t < total_tiles:
+        m_idx = t // t_tot
+        rem = t - m_idx * t_tot
+        src_e = tl.load(miss_src_ptr + m_idx).to(tl.int64)
+        dst_s = tl.load(miss_dst_ptr + m_idx).to(tl.int64)
+        if rem < t0:
+            col = rem * BLOCK_I32 + offs
+            mask = col < R0
+            vals = tl.load(s0_ptr + src_e * R0 + col, mask=mask, cache_modifier=".cg")
+            tl.store(d0_ptr + dst_s * R0 + col, vals, mask=mask)
+        elif rem < t01:
+            col = (rem - t0) * BLOCK_I32 + offs
+            mask = col < R1
+            vals = tl.load(s1_ptr + src_e * R1 + col, mask=mask, cache_modifier=".cg")
+            tl.store(d1_ptr + dst_s * R1 + col, vals, mask=mask)
+        elif rem < t012:
+            col = (rem - t01) * BLOCK_I32 + offs
+            mask = col < R2
+            vals = tl.load(s2_ptr + src_e * R2 + col, mask=mask, cache_modifier=".cg")
+            tl.store(d2_ptr + dst_s * R2 + col, vals, mask=mask)
+        else:
+            col = (rem - t012) * BLOCK_I32 + offs
+            mask = col < R3
+            vals = tl.load(s3_ptr + src_e * R3 + col, mask=mask, cache_modifier=".cg")
+            tl.store(d3_ptr + dst_s * R3 + col, vals, mask=mask)
+        t += NUM_CTAS
+
+
+@triton.jit
 def _prefill_resident_ids_kernel(
     ids_ptr,
     mapped_ids_ptr,
@@ -586,8 +665,41 @@ class PreparedExpertCache:
         del stub_i32
 
         def _build_copies(b_planes, s_planes, dst_slots, m_src, m_dst, m_cnt, max_m):
+            b_list = list(b_planes)
+            s_list = list(s_planes)
+            if len(b_list) == 4 and len(s_list) <= 4:
+                b_args = []
+                r_sizes = []
+                for pair in b_list:
+                    row_i32 = pair.row_bytes // 4
+                    dst_i32 = pair.dst_hbm.view(torch.uint8).reshape(dst_slots, pair.row_bytes).view(torch.int32)
+                    src_i32 = pair.src_host_dev.view(torch.uint8).reshape(state.num_experts, pair.row_bytes).view(torch.int32)
+                    b_args.extend((dst_i32, src_i32))
+                    r_sizes.append(row_i32)
+                s_chunk = list(s_list)
+                n_scalars = len(s_chunk)
+                fallback_scalar = b_args[0].reshape(-1)
+                while len(s_chunk) < 4:
+                    s_chunk.append(None)
+                s_args = []
+                for p in s_chunk:
+                    if p is None:
+                        s_args.extend((fallback_scalar, fallback_scalar))
+                    else:
+                        s_args.append(p.dst_hbm.view(torch.int32).reshape(-1))
+                        s_args.append(p.src_host_dev.view(torch.int32).reshape(-1))
+                max_row = max(r_sizes)
+                block_i32 = 4096 if max_row >= 4096 else max(64, triton.next_power_of_2(max_row))
+                s_block = max(16, triton.next_power_of_2(max(1, max_m)))
+                fused = prepare_triton(
+                    _copy_expert_fused_4x4_kernel,
+                    (*b_args, *s_args, m_src, m_dst, m_cnt, *r_sizes, block_i32, copy_ctas, n_scalars, s_block),
+                    (copy_ctas, 1, 1),
+                    num_warps=8,
+                )
+                return [fused], []
             b_ops = []
-            for pair in b_planes:
+            for pair in b_list:
                 row_i32 = pair.row_bytes // 4
                 dst_i32 = pair.dst_hbm.view(torch.uint8).reshape(dst_slots, pair.row_bytes).view(torch.int32)
                 src_i32 = pair.src_host_dev.view(torch.uint8).reshape(state.num_experts, pair.row_bytes).view(torch.int32)
@@ -602,7 +714,6 @@ class PreparedExpertCache:
                 )
             s_ops = []
             s_block = max(16, triton.next_power_of_2(max(1, max_m)))
-            s_list = list(s_planes)
             for idx in range(0, len(s_list), 4):
                 chunk = s_list[idx : idx + 4]
                 while len(chunk) < 4:
@@ -744,41 +855,76 @@ class PreparedPrefillExpertStreamer:
                 )
             )
 
-        self._bulk_copies = []
-        for pair in staging_bulk_planes:
-            row_i32 = pair.row_bytes // 4
-            dst_i32 = pair.dst_hbm.view(torch.uint8).reshape(staging_slots, pair.row_bytes).view(torch.int32)
-            src_i32 = pair.src_host_dev.view(torch.uint8).reshape(state.num_experts, pair.row_bytes).view(torch.int32)
-            block_i32 = 4096 if row_i32 >= 4096 else max(64, triton.next_power_of_2(row_i32))
-            self._bulk_copies.append(
+        b_list = list(staging_bulk_planes)
+        s_list = list(staging_scalar_planes)
+        if len(b_list) == 4 and len(s_list) <= 4:
+            b_args = []
+            r_sizes = []
+            for pair in b_list:
+                row_i32 = pair.row_bytes // 4
+                dst_i32 = pair.dst_hbm.view(torch.uint8).reshape(staging_slots, pair.row_bytes).view(torch.int32)
+                src_i32 = pair.src_host_dev.view(torch.uint8).reshape(state.num_experts, pair.row_bytes).view(torch.int32)
+                b_args.extend((dst_i32, src_i32))
+                r_sizes.append(row_i32)
+            s_chunk = list(s_list)
+            n_scalars = len(s_chunk)
+            fallback_scalar = b_args[0].reshape(-1)
+            while len(s_chunk) < 4:
+                s_chunk.append(None)
+            s_args = []
+            for p in s_chunk:
+                if p is None:
+                    s_args.extend((fallback_scalar, fallback_scalar))
+                else:
+                    s_args.append(p.dst_hbm.view(torch.int32).reshape(-1))
+                    s_args.append(p.src_host_dev.view(torch.int32).reshape(-1))
+            max_row = max(r_sizes)
+            block_i32 = 4096 if max_row >= 4096 else max(64, triton.next_power_of_2(max_row))
+            s_block = max(16, triton.next_power_of_2(staging_slots))
+            self._bulk_copies = [
                 prepare_triton(
-                    _copy_expert_plane_kernel,
-                    (dst_i32, src_i32, self.miss_src, self.miss_dst, self.miss_count, row_i32, block_i32, copy_ctas),
+                    _copy_expert_fused_4x4_kernel,
+                    (*b_args, *s_args, self.miss_src, self.miss_dst, self.miss_count, *r_sizes, block_i32, copy_ctas, n_scalars, s_block),
                     (copy_ctas, 1, 1),
                     num_warps=8,
                 )
-            )
-
-        self._scalar_copies = []
-        s_block = max(16, triton.next_power_of_2(staging_slots))
-        s_list = list(staging_scalar_planes)
-        for idx in range(0, len(s_list), 4):
-            chunk = s_list[idx : idx + 4]
-            while len(chunk) < 4:
-                chunk.append(chunk[-1])
-            c_len = min(4, len(s_list) - idx)
-            args = []
-            for p in chunk:
-                args.append(p.dst_hbm.view(torch.int32).reshape(-1))
-                args.append(p.src_host_dev.view(torch.int32).reshape(-1))
-            self._scalar_copies.append(
-                prepare_triton(
-                    _copy_expert_scalars_kernel,
-                    (*args, self.miss_src, self.miss_dst, self.miss_count, int(c_len >= 3), int(c_len >= 4), s_block),
-                    (1, 1, 1),
-                    num_warps=1,
+            ]
+            self._scalar_copies = []
+        else:
+            self._bulk_copies = []
+            for pair in b_list:
+                row_i32 = pair.row_bytes // 4
+                dst_i32 = pair.dst_hbm.view(torch.uint8).reshape(staging_slots, pair.row_bytes).view(torch.int32)
+                src_i32 = pair.src_host_dev.view(torch.uint8).reshape(state.num_experts, pair.row_bytes).view(torch.int32)
+                block_i32 = 4096 if row_i32 >= 4096 else max(64, triton.next_power_of_2(row_i32))
+                self._bulk_copies.append(
+                    prepare_triton(
+                        _copy_expert_plane_kernel,
+                        (dst_i32, src_i32, self.miss_src, self.miss_dst, self.miss_count, row_i32, block_i32, copy_ctas),
+                        (copy_ctas, 1, 1),
+                        num_warps=8,
+                    )
                 )
-            )
+
+            self._scalar_copies = []
+            s_block = max(16, triton.next_power_of_2(staging_slots))
+            for idx in range(0, len(s_list), 4):
+                chunk = s_list[idx : idx + 4]
+                while len(chunk) < 4:
+                    chunk.append(chunk[-1])
+                c_len = min(4, len(s_list) - idx)
+                args = []
+                for p in chunk:
+                    args.append(p.dst_hbm.view(torch.int32).reshape(-1))
+                    args.append(p.src_host_dev.view(torch.int32).reshape(-1))
+                self._scalar_copies.append(
+                    prepare_triton(
+                        _copy_expert_scalars_kernel,
+                        (*args, self.miss_src, self.miss_dst, self.miss_count, int(c_len >= 3), int(c_len >= 4), s_block),
+                        (1, 1, 1),
+                        num_warps=1,
+                    )
+                )
 
         total_elems = tokens * hidden_size
         self._add_inplace = prepare_triton(
