@@ -477,6 +477,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     sampling_workspace=sampling_workspace,
                     verification_width=max(config.speculative_widths), **collectives)
                 buffers.update(speculation.buffers())
+        _free, _total = device_memory_info(device)
+        report(f"VRAM after Allocate model state: {_free / (1 << 30):.2f} GiB free / {_total / (1 << 30):.2f} GiB")
         scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
             runtime=collective, coordinator=coordinator)
         graph_modes = serving_modes(config.mtp, config.mtp_only)
@@ -635,6 +637,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         if config.mixed_shapes:
             owners.remove(mixed_scratch)
             mixed_scratch = None
+        gc.collect()
+        torch.cuda.empty_cache()
         report(f"selected prepared kernels: {tuning['selection_counts']}")
         stream = torch.cuda.Stream(device=device)
         graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id

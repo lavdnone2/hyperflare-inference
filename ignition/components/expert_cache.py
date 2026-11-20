@@ -546,16 +546,15 @@ class PreparedExpertCache:
         self.ovf_count = persistent_zeros((1,), torch.int32, self.device)
 
         s_pow2 = max(16, triton.next_power_of_2(state.num_slots))
-        dummy_ids = torch.zeros((tokens, top_k), dtype=torch.int32, device=self.device)
-        dummy_mapped = torch.zeros((tokens, top_k), dtype=torch.int32, device=self.device)
-        dummy_ovf = torch.zeros((tokens, top_k), dtype=torch.int32, device=self.device)
+        # Tiny 16-element aligned stubs give identical Triton specialization without allocating [tokens, top_k].
+        stub_i32 = torch.empty((16,), dtype=torch.int32, device=self.device)
 
         self._resolve = prepare_triton(
             _slru_resolve_kernel,
             (
-                dummy_ids,
-                dummy_mapped,
-                dummy_ovf,
+                stub_i32,
+                stub_i32,
+                stub_i32,
                 state.expert_to_slot,
                 state.slot_to_expert,
                 state.slot_tier,
@@ -583,6 +582,8 @@ class PreparedExpertCache:
             (1, 1, 1),
             num_warps=1,
         )
+        self._resolve.args = (None, None, None, *self._resolve.args[3:])
+        del stub_i32
 
         def _build_copies(b_planes, s_planes, dst_slots, m_src, m_dst, m_cnt, max_m):
             b_ops = []
@@ -708,16 +709,17 @@ class PreparedPrefillExpertStreamer:
         self.miss_dst = persistent_zeros((staging_slots,), torch.int32, self.device)
         self.miss_count = persistent_zeros((1,), torch.int32, self.device)
 
-        dummy_ids = torch.zeros((tokens, top_k), dtype=torch.int32, device=self.device)
-        dummy_mapped = torch.zeros((tokens, top_k), dtype=torch.int32, device=self.device)
-        dummy_out = torch.zeros((tokens, hidden_size), dtype=torch.bfloat16, device=self.device)
+        # Tiny 16-element aligned stubs give identical Triton specialization without retaining [tokens, hidden] tensors.
+        stub_i32 = torch.empty((16,), dtype=torch.int32, device=self.device)
+        stub_bf16 = torch.empty((16,), dtype=torch.bfloat16, device=self.device)
 
         self._map_resident = prepare_triton(
             _prefill_resident_ids_kernel,
-            (dummy_ids, dummy_mapped, state.expert_to_slot, self.routes, state.num_experts, 256),
+            (stub_i32, stub_i32, state.expert_to_slot, self.routes, state.num_experts, 256),
             (triton.cdiv(self.routes, 256), 1, 1),
             num_warps=4,
         )
+        self._map_resident.args = (None, None, *self._map_resident.args[2:])
 
         self._slice_maps = []
         self._slice_compacts = []
@@ -725,14 +727,14 @@ class PreparedPrefillExpertStreamer:
             lo = p * staging_slots
             hi = min(state.num_experts, lo + staging_slots)
             width = hi - lo
-            self._slice_maps.append(
-                prepare_triton(
-                    _prefill_slice_map_kernel,
-                    (dummy_ids, dummy_mapped, state.expert_to_slot, self.slice_present, self.routes, lo, hi, 256),
-                    (triton.cdiv(self.routes, 256), 1, 1),
-                    num_warps=4,
-                )
+            sm = prepare_triton(
+                _prefill_slice_map_kernel,
+                (stub_i32, stub_i32, state.expert_to_slot, self.slice_present, self.routes, lo, hi, 256),
+                (triton.cdiv(self.routes, 256), 1, 1),
+                num_warps=4,
             )
+            sm.args = (None, None, *sm.args[2:])
+            self._slice_maps.append(sm)
             self._slice_compacts.append(
                 prepare_triton(
                     _prefill_slice_compact_kernel,
@@ -781,10 +783,12 @@ class PreparedPrefillExpertStreamer:
         total_elems = tokens * hidden_size
         self._add_inplace = prepare_triton(
             _add_bf16_inplace_kernel,
-            (dummy_out, dummy_out, total_elems, 1024),
+            (stub_bf16, stub_bf16, total_elems, 1024),
             (triton.cdiv(total_elems, 1024), 1, 1),
             num_warps=4,
         )
+        self._add_inplace.args = (None, None, *self._add_inplace.args[2:])
+        del stub_i32, stub_bf16
 
     def map_resident(self, ids: torch.Tensor, mapped_ids: torch.Tensor) -> torch.Tensor:
         launch_triton(
