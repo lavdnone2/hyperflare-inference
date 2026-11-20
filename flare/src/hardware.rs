@@ -394,6 +394,8 @@ mod tests {
         assert_eq!(platform(0x2bb110de), Some("gb202"));
         assert_eq!(platform(0x2bb510de), Some("gb202"));
         assert_eq!(platform(0x2b8510de), Some("gb202"));
+        assert_eq!(platform(0x2c0510de), Some("gb203"));
+        assert_eq!(platform(0x2c0210de), Some("gb203"));
         assert_eq!(platform(0x31c310de), Some("gb300"));
         assert_eq!(platform(0x26b110de), None);
         assert_eq!(platform(0x2bb41234), None);
