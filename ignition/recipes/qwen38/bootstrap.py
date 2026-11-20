@@ -403,7 +403,6 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,
                    "shard_hyperconnections": config.shard_hyperconnections,
                    "force_moe_decode_a16": config.force_moe_decode_a16,
-                   "expert_slots": str(config.expert_slots) if config.expert_slots is not None else None,
                    "vision_in_ram": config.vision_in_ram,
                    "embed_in_ram": config.embed_in_ram,
                    "speculative_method": config.speculative_method,

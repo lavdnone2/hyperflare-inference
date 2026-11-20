@@ -159,8 +159,13 @@ def candidate_scratch_limit(device, *, pools=1, headroom_bytes=0, pending_persis
     else:
         available -= headroom_bytes
     props = torch.cuda.get_device_properties(device)
-    growth = (896 << 20) if (not props.is_integrated and props.total_memory <= (20 << 30)) else _TUNING_GROWTH_BYTES
-    return max(0, available - growth - pending_persistent_bytes)
+    if not props.is_integrated and props.total_memory <= (20 << 30):
+        # Leave 896 MiB for full tuning growth when available, or allow up to 256 MiB scratch
+        # while retaining >= 192 MiB when high slot budgets reuse cached non-MoE kernels.
+        conservative = available - (896 << 20) - pending_persistent_bytes
+        tight = min(256 << 20, available - (192 << 20) - pending_persistent_bytes)
+        return max(0, conservative, tight)
+    return max(0, available - _TUNING_GROWTH_BYTES - pending_persistent_bytes)
 
 
 def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None):
