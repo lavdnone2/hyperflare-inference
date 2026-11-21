@@ -786,6 +786,7 @@ class QwenWeightLoader(DirectWeightLoader):
             )
             del tmp_hbm
             if a16:
+                init_idx_cpu = torch.tensor(init_ids, dtype=torch.int64)
                 hbm_experts._impl.w1_alphas.copy_(host_views["w1_alphas"].index_select(0, init_idx_cpu))
                 hbm_experts._impl.w2_alphas.copy_(host_views["w2_alphas"].index_select(0, init_idx_cpu))
             gc.collect()
