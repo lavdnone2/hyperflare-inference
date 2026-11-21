@@ -44,8 +44,14 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
         limit = min(limit, options['compile_threads'])
     available = host_memory.available_bytes()
     free = device_memory_info(device)[0]
-    shared = torch.cuda.get_device_properties(device).is_integrated
-    device_bytes = _WORKER_DEVICE_BYTES if shared else _DISCRETE_WORKER_DEVICE_BYTES
+    props = torch.cuda.get_device_properties(device)
+    shared = props.is_integrated
+    if shared:
+        device_bytes = _WORKER_DEVICE_BYTES
+    elif props.total_memory <= (20 << 30):
+        device_bytes = 512 << 20
+    else:
+        device_bytes = _DISCRETE_WORKER_DEVICE_BYTES
     capacity = max(0, (free - headroom_bytes) // device_bytes)
     if compile_workers is None:
         capacity = min(8, capacity)
