@@ -323,6 +323,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         config.online_mxfp8
         and config.draft_head_quantization == "mxfp8"
         and config.expert_slots is not None
+        and config.speculative_method == "dflash2"
     )
     with (contextlib.nullcontext() if core_storage is None else core_storage.transient()):
         weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
@@ -774,8 +775,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         return PreparedModel(rebuild_weights=declare_weights({'weights': weights, 'mtp': mtp_weights, 'draft': draft_weights, 'draft_head': draft_head}, components={
         'tree.model.language_model.embed_tokens': 'embedding',
         'tree.model.language_model.hyper_connection_mixer': 'hyper-connection',
-        'tree.lm_head': 'head',
-        'lm_head_quantized': 'head',
+        **({'lm_head_quantized': 'head'} if weights.lm_head_quantized is not None else {'tree.lm_head': 'head'}),
         'vision': 'vision',
         'mtp': 'mtp',
         'draft': 'draft',

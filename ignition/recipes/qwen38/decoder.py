@@ -164,6 +164,7 @@ class ModelWeights:
                     with _suspend_persistent_storage():
                         raw_head = loader.load_tensors(("lm_head.weight",), extents=(slice(*shard.partition(248320)),), temporary=True)[0]
                     lm_head_quantized = mxfp8_draft_head(raw_head)
+                    tree.lm_head.register_parameter("weight", None)
                     del raw_head
                     torch.cuda.empty_cache()
                 else:
@@ -175,6 +176,7 @@ class ModelWeights:
                 with _suspend_persistent_storage():
                     raw_head = loader.load_tensors(("lm_head.weight",), extents=(slice(*shard.partition(248320)),), temporary=True)[0]
                 lm_head_quantized = mxfp8_draft_head(raw_head)
+                tree.lm_head.register_parameter("weight", None)
                 del raw_head
                 torch.cuda.empty_cache()
             else:

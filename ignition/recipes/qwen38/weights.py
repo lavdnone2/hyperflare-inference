@@ -287,6 +287,124 @@ def pack_legacy_nvfp4_csf_for_shard(
     )
 
 
+def pack_legacy_nvfp4_csf_from_staged(
+    scales13,
+    scales2,
+    *,
+    first: int,
+    last: int,
+    hidden_size: int = 2560,
+    intermediate_size: int = 640,
+    num_experts: int = 512,
+    a16_layout: bool = False,
+    w1_lut=None,
+    w2_lut=None,
+):
+    """Vectorized GPU packer for staged CsfSource (works with DirectWeightLoader meta sources).
+
+    Returns GPU tensors ``(w1_fixed, w2_fixed, w1_exc, w1_starts, w2_exc, w2_starts)``.
+    """
+    import torch
+
+    local_i = last - first
+    c1 = hidden_size // 16
+    c2_full = intermediate_size // 16
+    c2 = local_i // 16
+    if first % 16 != 0 or last % 16 != 0 or (first // 16) % 2 != 0 or c2 % 2 != 0:
+        raise ValueError(f"TP shard [{first}, {last}) must be 32-aligned for byte-exact CSF slicing")
+    slab_lo, slab_hi = first // 16, last // 16
+    col_byte_lo, col_byte_hi = (first // 16) // 2, (last // 16) // 2
+    r1, r2 = 2 * local_i, hidden_size
+    device = scales13.components[0].device
+
+    # Fixed planes: direct GPU slice (zero host/meta reads).
+    f13_raw = scales13.components[0]  # (2*E, intermediate_size//16, 16*(1+c1//2))
+    w1_fixed = (
+        f13_raw.view(num_experts, 2, intermediate_size // 16, -1)[:, :, slab_lo:slab_hi, :]
+        .contiguous()
+        .reshape(num_experts, -1)
+    )
+
+    f2_raw = scales2.components[0]  # (E, r2//16, 16*(1+c2_full//2))
+    dn_bases = f2_raw[:, :, :16]
+    dn_codes = (
+        f2_raw[:, :, 16:]
+        .reshape(num_experts, r2 // 16, 16, c2_full // 2)[:, :, :, col_byte_lo:col_byte_hi]
+        .reshape(num_experts, r2 // 16, 16 * (c2 // 2))
+    )
+    w2_fixed = torch.cat((dn_bases, dn_codes), dim=2).contiguous().reshape(num_experts, -1)
+
+    # Pre-swizzle w1 exceptions vectorized on GPU.
+    st13 = scales13.starts
+    exc13 = scales13.components[1]
+    if exc13.numel() > 0:
+        seg_counts1 = st13[1:] - st13[:-1]
+        seg_ids1 = torch.repeat_interleave(
+            torch.arange(2 * num_experts, device=device, dtype=torch.int64), seg_counts1
+        )
+        exp_ids1 = seg_ids1 >> 1
+        half_ids1 = seg_ids1 & 1
+        words1 = exc13.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        idx1 = words1 & 0xFFFFFF
+        val1 = (words1 >> 24) & 0xFF
+        sr1 = idx1 // c1
+        sc1 = idx1 - sr1 * c1
+        keep1 = (sr1 >= first) & (sr1 < last)
+        exp_k1 = exp_ids1[keep1]
+        if exp_k1.numel() > 0:
+            r_loc1 = (sr1[keep1] - first) + half_ids1[keep1] * local_i
+            c_loc1 = sc1[keep1]
+            v_loc1 = val1[keep1]
+            if w1_lut is not None:
+                v_loc1 = w1_lut[v_loc1].to(torch.int64)
+            off1 = _csf_dst_offset(r_loc1, c_loc1, r1, c1, a16_layout=a16_layout)
+            w1_exc = ((v_loc1 << 24) | off1).to(torch.int32).view(torch.uint32).contiguous()
+            w1_starts = torch.zeros((num_experts + 1,), dtype=torch.int64, device=device)
+            w1_starts[1:] = torch.bincount(exp_k1, minlength=num_experts).cumsum(0)
+        else:
+            w1_exc = torch.zeros((1,), dtype=torch.uint32, device=device)
+            w1_starts = torch.zeros((num_experts + 1,), dtype=torch.int64, device=device)
+    else:
+        w1_exc = torch.zeros((1,), dtype=torch.uint32, device=device)
+        w1_starts = torch.zeros((num_experts + 1,), dtype=torch.int64, device=device)
+
+    # Pre-swizzle w2 exceptions vectorized on GPU.
+    st2 = scales2.starts
+    exc2 = scales2.components[1]
+    if exc2.numel() > 0:
+        seg_counts2 = st2[1:] - st2[:-1]
+        exp_ids2 = torch.repeat_interleave(
+            torch.arange(num_experts, device=device, dtype=torch.int64), seg_counts2
+        )
+        words2 = exc2.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        idx2 = words2 & 0xFFFFFF
+        val2 = (words2 >> 24) & 0xFF
+        sr2 = idx2 // c2_full
+        sc2 = idx2 - sr2 * c2_full
+        c0 = first // 16
+        c1_end = last // 16
+        keep2 = (sc2 >= c0) & (sc2 < c1_end)
+        exp_k2 = exp_ids2[keep2]
+        if exp_k2.numel() > 0:
+            r_loc2 = sr2[keep2]
+            c_loc2 = sc2[keep2] - c0
+            v_loc2 = val2[keep2]
+            if w2_lut is not None:
+                v_loc2 = w2_lut[v_loc2].to(torch.int64)
+            off2 = _csf_dst_offset(r_loc2, c_loc2, r2, c2, a16_layout=a16_layout)
+            w2_exc = ((v_loc2 << 24) | off2).to(torch.int32).view(torch.uint32).contiguous()
+            w2_starts = torch.zeros((num_experts + 1,), dtype=torch.int64, device=device)
+            w2_starts[1:] = torch.bincount(exp_k2, minlength=num_experts).cumsum(0)
+        else:
+            w2_exc = torch.zeros((1,), dtype=torch.uint32, device=device)
+            w2_starts = torch.zeros((num_experts + 1,), dtype=torch.int64, device=device)
+    else:
+        w2_exc = torch.zeros((1,), dtype=torch.uint32, device=device)
+        w2_starts = torch.zeros((num_experts + 1,), dtype=torch.int64, device=device)
+
+    return w1_fixed, w2_fixed, w1_exc, w1_starts, w2_exc, w2_starts
+
+
 @contextmanager
 def _suspend_persistent_storage():
     """Temporarily divert persistent_empty() to regular PyTorch allocations for bounded staging."""
@@ -588,14 +706,12 @@ class QwenWeightLoader(DirectWeightLoader):
 
         if use_csf:
             a16 = bool(self.force_moe_decode_a16)
-            w1_lut = w2_lut = w1_lut_cpu = w2_lut_cpu = None
+            w1_lut = w2_lut = None
             if a16:
                 from b12x.moe._shared.kernels.w4a16.prepare import _process_nvfp4_packed_global_scale
 
                 w1_lut = _a16_scale_lut(self.device, scale_factor=1.0)
                 w2_lut = _a16_scale_lut(self.device, scale_factor=1.0)
-                w1_lut_cpu = w1_lut.cpu()
-                w2_lut_cpu = w2_lut.cpu()
                 # Normalize all 512 experts' a16 global scales to deterministic scale_factor=1.0
                 # so batches cannot drift from the shared 256-entry scale LUT.
                 all_sv = _expert_scale_vectors(self._sources, layer, tuple(range(512)))
@@ -606,37 +722,53 @@ class QwenWeightLoader(DirectWeightLoader):
 
             first, last = self.shard.partition(640, alignment=16)
             local_i = last - first
-            w1_fix_cpu, w2_fix_cpu, w1_exc_cpu, w1_st_cpu, w2_exc_cpu, w2_st_cpu = pack_legacy_nvfp4_csf_for_shard(
-                self._sources,
-                f"{TEXT_PREFIX}.layers.{layer}.mlp.experts",
-                first=first,
-                last=last,
-                hidden_size=2560,
-                intermediate_size=640,
-                num_experts=512,
-                a16_layout=a16,
-                w1_lut_cpu=w1_lut_cpu,
-                w2_lut_cpu=w2_lut_cpu,
-            )
-            for cname, cpu_t in (("w1_csf_fixed", w1_fix_cpu), ("w2_csf_fixed", w2_fix_cpu)):
-                reg = _alloc_host(f"layer{layer}.experts.{cname}", tuple(cpu_t.shape), cpu_t.dtype)
-                reg.host_view.copy_(cpu_t)
-                host_views[cname] = reg.host_view
-                host_dev_views[cname] = reg.device_view
+            layer_prefix = f"{TEXT_PREFIX}.layers.{layer}.mlp.experts"
+            w1_projs = ("gate_proj", "up_proj") if a16 else ("up_proj", "gate_proj")
+            with _suspend_persistent_storage():
+                scales13 = self._queue_csf_sources(
+                    [f"{layer_prefix}.{e}.{proj}.weight_scale" for e in range(512) for proj in w1_projs],
+                    rows=640, columns=2560 // 16, join=2, temporary=True,
+                    row_range=(first, last),
+                )
+                scales2 = self._queue_csf_sources(
+                    [f"{layer_prefix}.{e}.down_proj.weight_scale" for e in range(512)],
+                    rows=2560, columns=640 // 16, temporary=True,
+                    column_range=(first // 16, last // 16),
+                )
+                self._session.flush()
+                w1_fix_gpu, w2_fix_gpu, w1_exc_gpu, w1_st_gpu, w2_exc_gpu, w2_st_gpu = pack_legacy_nvfp4_csf_from_staged(
+                    scales13,
+                    scales2,
+                    first=first,
+                    last=last,
+                    hidden_size=2560,
+                    intermediate_size=640,
+                    num_experts=512,
+                    a16_layout=a16,
+                    w1_lut=w1_lut,
+                    w2_lut=w2_lut,
+                )
+                del scales13, scales2
+                for cname, gpu_t in (("w1_csf_fixed", w1_fix_gpu), ("w2_csf_fixed", w2_fix_gpu)):
+                    reg = _alloc_host(f"layer{layer}.experts.{cname}", tuple(gpu_t.shape), gpu_t.dtype)
+                    reg.host_view.copy_(gpu_t.cpu())
+                    host_views[cname] = reg.host_view
+                    host_dev_views[cname] = reg.device_view
 
             # All 48 layers x 512 experts of pre-swizzled CSF exceptions total only ~46 MiB/rank;
             # keeping them resident in HBM eliminates PCIe scatter latency (<0.2 ms / 48L).
-            w1_exc_hbm = persistent_copy(w1_exc_cpu.to(self.device))
-            w2_exc_hbm = persistent_copy(w2_exc_cpu.to(self.device))
+            w1_exc_hbm = persistent_copy(w1_exc_gpu)
+            w2_exc_hbm = persistent_copy(w2_exc_gpu)
             csf_exc_planes = {"w1_csf_exc": w1_exc_hbm, "w2_csf_exc": w2_exc_hbm}
 
-            w1_starts_hbm = persistent_copy(w1_st_cpu.to(self.device))
-            w2_starts_hbm = persistent_copy(w2_st_cpu.to(self.device))
-            w1_fix_hbm = persistent_empty((num_slots, w1_fix_cpu.shape[1]), torch.uint8, self.device)
-            w2_fix_hbm = persistent_empty((num_slots, w2_fix_cpu.shape[1]), torch.uint8, self.device)
-            init_idx_cpu = torch.tensor(init_ids, dtype=torch.int64)
-            w1_fix_hbm.copy_(w1_fix_cpu.index_select(0, init_idx_cpu))
-            w2_fix_hbm.copy_(w2_fix_cpu.index_select(0, init_idx_cpu))
+            w1_starts_hbm = persistent_copy(w1_st_gpu)
+            w2_starts_hbm = persistent_copy(w2_st_gpu)
+            init_idx_gpu = torch.tensor(init_ids, dtype=torch.int64, device=self.device)
+            w1_fix_hbm = persistent_copy(w1_fix_gpu.index_select(0, init_idx_gpu))
+            w2_fix_hbm = persistent_copy(w2_fix_gpu.index_select(0, init_idx_gpu))
+            del w1_fix_gpu, w2_fix_gpu, w1_exc_gpu, w2_exc_gpu, w1_st_gpu, w2_st_gpu, init_idx_gpu
+            gc.collect()
+            torch.cuda.empty_cache()
 
             hbm_csf_planes = {
                 "w1_csf_fixed": w1_fix_hbm,
