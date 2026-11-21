@@ -782,6 +782,17 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         gc.collect()
         torch.cuda.empty_cache()
         report(f"selected prepared kernels: {tuning['selection_counts']}")
+        import os
+        import sys
+        if os.environ.get("FLARE_TUNE_ONLY") == "1":
+            session.close()
+            table.close()
+            if group is not None:
+                torch.distributed.barrier(group)
+            report("FLARE_TUNE_ONLY=1: tuning cache populated; exiting cleanly.")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         stream = torch.cuda.Stream(device=device)
         graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
         compiled_functions = {}
