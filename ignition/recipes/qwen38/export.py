@@ -7,7 +7,7 @@
 from ignition.preparation.disposable import storage_ranges
 
 
-def disposable_ranges(*, cache, staging_experts=None):
+def disposable_ranges(*, cache, staging_experts=None, staging_csf=None, shared_scale_scratch=None):
     values = []
     for state in cache.values():
         values.extend((state.main_k_cache, state.main_v_cache, state.compressed_k_cache, state.raw_k_ring))
@@ -19,4 +19,8 @@ def disposable_ranges(*, cache, staging_experts=None):
                 t = getattr(impl, field, None)
                 if t is not None:
                     values.append(t)
+    if staging_csf is not None:
+        values.extend(staging_csf.values())
+    if shared_scale_scratch is not None:
+        values.extend(shared_scale_scratch)
     return storage_ranges(values)

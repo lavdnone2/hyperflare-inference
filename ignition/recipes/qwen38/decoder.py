@@ -69,6 +69,13 @@ class ModelWeights:
     allocated_bytes: int
     shard: TensorParallelShard = TensorParallelShard(0, 1)
     prefill_staging_experts: object | None = None
+    prefill_staging_csf: dict[str, torch.Tensor] | None = None
+    shared_scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
+    lm_head_quantized: object | None = None
+
+    @property
+    def head_weight(self):
+        return self.lm_head_quantized if self.lm_head_quantized is not None else self.tree.lm_head.weight
 
     @classmethod
     def load(cls, manifest: CheckpointManifest, device: torch.device,
@@ -76,7 +83,8 @@ class ModelWeights:
              shard: TensorParallelShard = TensorParallelShard(0, 1),
              shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False,
              expert_slots=None, vision_in_ram: bool = False, embed_in_ram: bool = False,
-             host_allocator=None) -> ModelWeights:
+             host_allocator=None, expert_scale_compression: str | None = None,
+             quantize_lm_head_mxfp8: bool = False) -> ModelWeights:
         from .weights import _suspend_persistent_storage, load_expert_slots_config
 
         device = torch.device(device)
@@ -96,8 +104,14 @@ class ModelWeights:
             if free_bytes < stored // shard.world_size + (8 << 30):
                 raise MemoryError(f"model weight loading requires at least {stored // shard.world_size + (8 << 30)} free CUDA bytes; found {free_bytes}")
         else:
-            est_expert_bytes = slots_cfg.total_slots * (2_764_800 // shard.world_size) + 64 * (2_764_800 // shard.world_size)
-            est_other_bytes = (4 << 30) - ((1 << 30) if embed_in_ram else 0) - ((300 << 20) if vision_in_ram else 0)
+            per_slot_bytes = 2_617_600 if expert_scale_compression == "csf" else 2_764_800
+            est_expert_bytes = slots_cfg.total_slots * (per_slot_bytes // shard.world_size) + 64 * (per_slot_bytes // shard.world_size)
+            est_other_bytes = (
+                (4 << 30)
+                - ((1 << 30) if embed_in_ram else 0)
+                - ((300 << 20) if vision_in_ram else 0)
+                - ((300 << 20) if quantize_lm_head_mxfp8 else 0)
+            )
             min_need = est_expert_bytes + max(0, est_other_bytes) + (1 << 30)
             if free_bytes < min_need:
                 raise MemoryError(f"tiered Qwen weight loading requires at least {min_need} free CUDA bytes; found {free_bytes}")
@@ -105,6 +119,9 @@ class ModelWeights:
         before = allocated_tensor_bytes(device)
         layers = []
         prefill_staging_experts = None
+        prefill_staging_csf = None
+        shared_scale_scratch = None
+        lm_head_quantized = None
         embed_host_alloc = None
         with QwenWeightLoader(manifest, device, progress=progress, shard=shard,
                               force_moe_decode_a16=force_moe_decode_a16) as loader:
@@ -141,10 +158,32 @@ class ModelWeights:
                 torch.cuda.empty_cache()
                 tree.get_submodule(f"{TEXT_PREFIX}.embed_tokens").weight = torch.nn.Parameter(
                     embed_host_alloc.device_view, requires_grad=False)
-                parameters(("lm_head.weight",), (slice(*shard.partition(248320)),))
+                if quantize_lm_head_mxfp8:
+                    from ignition.components.vocabulary import mxfp8_draft_head
+
+                    with _suspend_persistent_storage():
+                        raw_head = loader.load_tensors(("lm_head.weight",), extents=(slice(*shard.partition(248320)),), temporary=True)[0]
+                    lm_head_quantized = mxfp8_draft_head(raw_head)
+                    del raw_head
+                    torch.cuda.empty_cache()
+                else:
+                    parameters(("lm_head.weight",), (slice(*shard.partition(248320)),))
+            elif quantize_lm_head_mxfp8:
+                from ignition.components.vocabulary import mxfp8_draft_head
+
+                parameters((f"{TEXT_PREFIX}.embed_tokens.weight",))
+                with _suspend_persistent_storage():
+                    raw_head = loader.load_tensors(("lm_head.weight",), extents=(slice(*shard.partition(248320)),), temporary=True)[0]
+                lm_head_quantized = mxfp8_draft_head(raw_head)
+                del raw_head
+                torch.cuda.empty_cache()
             else:
                 parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
                            (None, slice(*shard.partition(248320))))
+            if slots_cfg is not None and expert_scale_compression == "csf":
+                shared_scale_scratch = loader.allocate_shared_scale_scratch(
+                    max_slots=max(max(slots_cfg.slots), 64)
+                )
             hyperconnection(f"{TEXT_PREFIX}.hyper_connection_mixer")
             for layer in range(48):
                 prefix = f"{TEXT_PREFIX}.layers.{layer}"
@@ -183,6 +222,8 @@ class ModelWeights:
                         num_slots=slots_cfg.slots[layer],
                         initial_experts=slots_cfg.initial_experts[layer],
                         host_allocator=host_allocator,
+                        scale_compression=expert_scale_compression,
+                        shared_scale_scratch=shared_scale_scratch,
                     )
                 else:
                     moe = QwenMoeWeights.load(loader, layer)
@@ -191,7 +232,10 @@ class ModelWeights:
                 module.shared_expert_gate.weight = torch.nn.Parameter(moe.shared.gate, requires_grad=False)
                 layers.append(DecoderLayerWeights(attention, moe))
             if slots_cfg is not None:
-                prefill_staging_experts = loader.allocate_prefill_staging_experts(staging_slots=64)
+                prefill_staging_experts, prefill_staging_csf = loader.allocate_prefill_staging_experts(
+                    staging_slots=64,
+                    shared_scale_scratch=shared_scale_scratch,
+                )
 
             prefix = f"{TEXT_PREFIX}.layers.1.ple"
             parameters(tuple(f"{prefix}.{name}" for name in
@@ -205,7 +249,10 @@ class ModelWeights:
         torch.cuda.empty_cache()
         return cls(tree, tuple(layers), vision,
                    allocated_tensor_bytes(device) - before, shard,
-                   prefill_staging_experts=prefill_staging_experts)
+                   prefill_staging_experts=prefill_staging_experts,
+                   prefill_staging_csf=prefill_staging_csf,
+                   shared_scale_scratch=shared_scale_scratch,
+                   lm_head_quantized=lm_head_quantized)
 
     def reset_expert_caches(self) -> None:
         """Restore initial SLRU residency, weights, and zeroed stats for all tiered MoE layers."""
@@ -352,7 +399,8 @@ class PreparedDecoder:
             moe = PreparedQwenMoe(source, layer_weights.moe, session=session, name=f"{prefix}.moe",
                 scratch=scratch.moe, workspace=workspaces,
                 projection_workspace=workspaces, prefill=state.mode == "prefill",
-                prefill_staging_experts=weights.prefill_staging_experts)
+                prefill_staging_experts=weights.prefill_staging_experts,
+                prefill_staging_csf=weights.prefill_staging_csf)
             self.layers.append((attn_hc, attention, mlp_hc, moe))
             if runtime is not None:
                 from ignition.components.collectives import PreparedAllReduce
@@ -380,16 +428,24 @@ class PreparedDecoder:
                     session=session, name=f"{name}.layer{index}.mlp_combine_norm")
         state.prepare_hidden(scratch.hidden, scratch.sample_hidden)
         state.prepare_residual(scratch.residual)
+        head_weight = weights.head_weight
         if vocabulary_runtime is None:
-            self.lm_head = UnquantizedProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
-                scratch.logits, session=session, name=f"{name}.lm_head")
+            if isinstance(head_weight, torch.Tensor):
+                self.lm_head = UnquantizedProjection(scratch.sample_hidden, head_weight,
+                    scratch.logits, session=session, name=f"{name}.lm_head")
+            else:
+                from ignition.components.linear import QuantizedProjection
+
+                self.lm_head = QuantizedProjection(scratch.sample_hidden, head_weight,
+                    scratch.logits, session=session, name=f"{name}.lm_head",
+                    activation_mode="a16", workspace=workspaces)
         else:
             from ignition.components.vocabulary import PreparedVocabularyProjection
 
-            self.lm_head = PreparedVocabularyProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
+            self.lm_head = PreparedVocabularyProjection(scratch.sample_hidden, head_weight,
                 scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, session=session,
-                coordinator=coordinator, name=f"{name}.lm_head")
-        self.scoring = None if scoring is None else scoring.prepare(scratch.hidden, weights.tree.lm_head.weight,
+                coordinator=coordinator, name=f"{name}.lm_head", workspace=workspaces)
+        self.scoring = None if scoring is None else scoring.prepare(scratch.hidden, head_weight,
             vocabulary=248320, session=session, coordinator=coordinator, name=name + ".prompt")
         self.sampler = None
         if not verification:

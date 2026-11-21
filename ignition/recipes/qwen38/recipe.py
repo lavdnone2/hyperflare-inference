@@ -57,6 +57,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         force_moe_decode_a16=plan.force_moe_decode_a16,
         shard_hyperconnections=plan.shard_hyperconnections,
         expert_slots=plan.expert_slots,
+        expert_scale_compression=plan.expert_scale_compression,
         vision_in_ram=plan.vision_in_ram,
         embed_in_ram=plan.embed_in_ram,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
@@ -97,7 +98,8 @@ RECIPE = Recipe(
         draft_bytes=1_596_720_640,
         # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
         # 48 layers x 512 experts x 307,200 bytes.
-        expansion_bytes=3_393_142_636),),
+        expansion_bytes=3_393_142_636,
+        scale_compressed_device_bytes=MappingProxyType({"csf": 70_136_363_264}),),),
     context=262144, page_tokens=64, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     # Rounds adapt among zero through five drafts, up to seven. Verification records
     # corrections and commits accepted tokens into the live state row, so it keeps

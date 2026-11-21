@@ -383,8 +383,9 @@ class PreparedResume:
 
     def __init__(self, inputs, requests, pool, sample_hidden, logits, lm_head_weight,
                  completion, frame_index, submission_sequence, *, session, name,
-                 local_logits=None, vocabulary_runtime=None, coordinator=None, sampling_workspace=None):
-        from ignition.components.linear import UnquantizedProjection
+                 local_logits=None, vocabulary_runtime=None, coordinator=None, sampling_workspace=None,
+                 workspace=None):
+        from ignition.components.linear import QuantizedProjection, UnquantizedProjection
         from ignition.components.sampling import PreparedSampling
 
         rows = sample_hidden.shape[0]
@@ -397,12 +398,16 @@ class PreparedResume:
             (rows, 1, 1))
         self.sample_hidden = sample_hidden
         if vocabulary_runtime is None:
-            self.projection = UnquantizedProjection(sample_hidden, lm_head_weight, logits, session=session, name=name)
+            if isinstance(lm_head_weight, torch.Tensor):
+                self.projection = UnquantizedProjection(sample_hidden, lm_head_weight, logits, session=session, name=name)
+            else:
+                self.projection = QuantizedProjection(sample_hidden, lm_head_weight, logits, session=session, name=name,
+                    activation_mode="a16", workspace=workspace)
         else:
             from ignition.components.vocabulary import PreparedVocabularyProjection
 
             self.projection = PreparedVocabularyProjection(sample_hidden, lm_head_weight, local_logits, logits,
-                runtime=vocabulary_runtime, session=session, coordinator=coordinator, name=name)
+                runtime=vocabulary_runtime, session=session, coordinator=coordinator, name=name, workspace=workspace)
         self.sampler = PreparedSampling(logits, requests, inputs.row_slot_ids[:rows],
             inputs.row_generations[:rows], inputs.live_rows, completion, frame_index, submission_sequence,
             sample_enabled=inputs.sample_enabled[:rows], workspace=sampling_workspace)

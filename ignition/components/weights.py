@@ -139,7 +139,7 @@ for _container, _fields in (
     ('ignition.recipes.nemotron_h.draft_weights.DraftWeights',
      ('projection', 'hidden_norm', 'norm', 'context_kv', 'layers', 'lattice')),
     ('ignition.recipes.qwen38.vision.VisionWeights', ('parameters', 'projections')),
-    ('ignition.recipes.qwen38.weights.TieredExpertWeights', ('host_planes',)),
+    ('ignition.recipes.qwen38.weights.TieredExpertWeights', ('host_planes', 'hbm_csf_planes', 'csf_exc_planes')),
     ('ignition.recipes.qwen38.mtp_weights.MTPWeights',
      ('module', 'attention', 'moe', 'embedding', 'lm_head', 'draft_head')),
     ('ignition.recipes.step5.vision_weights.VisionWeights',

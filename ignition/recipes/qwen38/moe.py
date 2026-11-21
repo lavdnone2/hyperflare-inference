@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from b12x.gemm import blockscaled
@@ -68,6 +68,8 @@ class QwenMoeWeights:
         num_slots: int | None = None,
         initial_experts=None,
         host_allocator=None,
+        scale_compression: str | None = None,
+        shared_scale_scratch=None,
     ) -> QwenMoeWeights:
         shared = SharedExpertWeights.load(loader, layer)
         router = loader.load_tensor(f"{TEXT_PREFIX}.layers.{layer}.mlp.gate.weight")
@@ -77,6 +79,8 @@ class QwenMoeWeights:
                 num_slots=num_slots,
                 initial_experts=initial_experts,
                 host_allocator=host_allocator,
+                scale_compression=scale_compression,
+                shared_scale_scratch=shared_scale_scratch,
             )
             return cls(
                 router,
@@ -199,7 +203,7 @@ class PreparedQwenMoe:
     def __init__(self, source, weights: QwenMoeWeights, *, session: PreparationSession, name: str,
                  scratch: QwenMoeScratch | None = None, workspace: ScratchArena | torch.Tensor | None = None,
                  projection_workspace: ScratchArena | torch.Tensor | None = None, prefill: bool = False,
-                 prefill_staging_experts=None):
+                 prefill_staging_experts=None, prefill_staging_csf=None):
         tiered = weights.tiered
         if tiered is None:
             if (weights.experts.num_experts, weights.experts.hidden_size) != (512, 2560):
@@ -232,10 +236,21 @@ class PreparedQwenMoe:
             routes = tokens * top_k
             staging_slots = 0 if prefill_staging_experts is None else prefill_staging_experts.num_experts
             use_stream = prefill or (routes > tiered.num_slots + staging_slots)
+            stg_csf_spec = (
+                replace(
+                    tiered.csf_spec,
+                    w1_fixed_hbm=prefill_staging_csf["w1_csf_fixed"],
+                    w2_fixed_hbm=prefill_staging_csf["w2_csf_fixed"],
+                )
+                if tiered.csf_spec is not None and prefill_staging_csf is not None
+                else None
+            )
             if use_stream:
                 if prefill_staging_experts is None:
                     raise ValueError("tiered wide/prefill MoE requires a shared prefill_staging_experts pool")
-                stg_bulk, stg_sc = collect_expert_planes(prefill_staging_experts, tiered.host_planes)
+                stg_bulk, stg_sc = collect_expert_planes(
+                    prefill_staging_experts, tiered.host_planes, csf_hbm_planes=prefill_staging_csf
+                )
                 self.prefill_streamer = PreparedPrefillExpertStreamer(
                     tiered.cache_state,
                     stg_bulk,
@@ -244,6 +259,8 @@ class PreparedQwenMoe:
                     top_k=top_k,
                     hidden_size=2560,
                     staging_slots=staging_slots,
+                    csf_spec=tiered.csf_spec,
+                    staging_csf_spec=stg_csf_spec,
                 )
                 self.staging_experts = PreparedRoutedExperts(
                     source, prefill_staging_experts, self.router.ids, self.router.weights, self.routed_output,
@@ -251,7 +268,9 @@ class PreparedQwenMoe:
                     router_plan=self.routing.plan, a4_prefill=prefill and weights.experts_a4_prefill,
                 )
             elif routes > tiered.num_slots:
-                stg_bulk, stg_sc = collect_expert_planes(prefill_staging_experts, tiered.host_planes)
+                stg_bulk, stg_sc = collect_expert_planes(
+                    prefill_staging_experts, tiered.host_planes, csf_hbm_planes=prefill_staging_csf
+                )
                 self.expert_cache = PreparedExpertCache(
                     tiered.cache_state,
                     tiered.bulk_planes,
@@ -261,6 +280,8 @@ class PreparedQwenMoe:
                     staging_bulk_planes=stg_bulk,
                     staging_scalar_planes=stg_sc,
                     staging_slots=staging_slots,
+                    csf_spec=tiered.csf_spec,
+                    staging_csf_spec=stg_csf_spec,
                 )
                 self.staging_experts = PreparedRoutedExperts(
                     source, prefill_staging_experts, self.router.ids, self.router.weights, self.routed_output,
@@ -274,6 +295,7 @@ class PreparedQwenMoe:
                     tiered.scalar_planes,
                     tokens=tokens,
                     top_k=top_k,
+                    csf_spec=tiered.csf_spec,
                 )
         self.experts = PreparedRoutedExperts(source, weights.experts, self.router.ids,
             self.router.weights, self.routed_output, session=session, name=f"{name}.experts", workspace=workspace,
@@ -337,6 +359,7 @@ class PreparedQwenMoe:
             return self.experts.reduce(shared, staged=staged)
         routed = self.experts(source, route_ids, routes.weights)
         if ovf_ids is not None:
+            self.expert_cache.expand_overflow()
             routed = routed + self.staging_experts(source, ovf_ids, routes.weights)
         if self.concurrent_shared is not None:
             projected = self.concurrent_shared.finish(pending, routed)

@@ -30,6 +30,8 @@ from ignition.preparation.persistent import persistent_empty, persistent_zeros
 from ignition.preparation.triton import launch_triton, prepare_triton
 
 DEFAULT_COPY_CTAS = 8
+DEFAULT_EXPAND_CTAS = 64
+DEFAULT_SCATTER_CTAS = 32
 MAX_PLANES = 12
 
 
@@ -51,6 +53,9 @@ def _slru_resolve_kernel(
     ovf_src_ptr,
     ovf_dst_ptr,
     ovf_count_ptr,
+    act_src_ptr,
+    act_dst_ptr,
+    act_count_ptr,
     M: tl.constexpr,
     E: tl.constexpr,
     S: tl.constexpr,
@@ -61,6 +66,7 @@ def _slru_resolve_kernel(
     OVF_POW2: tl.constexpr,
     UPDATE_CACHE: tl.constexpr,
     HANDLE_OVERFLOW: tl.constexpr,
+    EMIT_ACTIVE: tl.constexpr,
 ):
     offs_s = tl.arange(0, S_POW2)
     in_s = offs_s < S
@@ -180,6 +186,15 @@ def _slru_resolve_kernel(
     tl.store(miss_count_ptr, n_miss)
     if HANDLE_OVERFLOW:
         tl.store(ovf_count_ptr, n_ovf)
+    if EMIT_ACTIVE:
+        tl.debug_barrier()
+        n_act = tl.zeros((), dtype=tl.int32)
+        for s in range(S):
+            if tl.load(slot_busy_ptr + s) != 0:
+                tl.store(act_dst_ptr + n_act, s)
+                tl.store(act_src_ptr + n_act, tl.load(slot_to_expert_ptr + s))
+                n_act += 1
+        tl.store(act_count_ptr, n_act)
     tl.store(stats_ptr + 0, tl.load(stats_ptr + 0) + lookups)
     tl.store(stats_ptr + 1, tl.load(stats_ptr + 1) + hits)
     tl.store(stats_ptr + 2, tl.load(stats_ptr + 2) + (lookups - hits))
@@ -335,8 +350,10 @@ def _prefill_resident_ids_kernel(
     ids_ptr,
     mapped_ids_ptr,
     expert_to_slot_ptr,
+    res_present_ptr,
     M: tl.constexpr,
     E: tl.constexpr,
+    EMIT_PRESENT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Map resident canonical IDs -> HBM slot IDs and mask cold experts to -1 (read-only cache)."""
@@ -346,6 +363,202 @@ def _prefill_resident_ids_kernel(
     valid = mask & (e >= 0) & (e < E)
     slot = tl.load(expert_to_slot_ptr + tl.where(valid, e, 0), mask=valid, other=-1)
     tl.store(mapped_ids_ptr + offs, tl.where(valid, slot, -1), mask=mask)
+    if EMIT_PRESENT:
+        hit = valid & (slot >= 0)
+        tl.store(res_present_ptr + tl.where(hit, slot, 0), 1, mask=hit)
+
+
+@triton.jit
+def _prefill_resident_compact_kernel(
+    res_present_ptr,
+    slot_to_expert_ptr,
+    act_src_ptr,
+    act_dst_ptr,
+    act_count_ptr,
+    S: tl.constexpr,
+):
+    """Compact touched resident slots [0, S) into (act_src, act_dst, act_count) and clear flags."""
+    n = tl.zeros((), dtype=tl.int32)
+    for s in range(S):
+        if tl.load(res_present_ptr + s) != 0:
+            tl.store(act_dst_ptr + n, s)
+            tl.store(act_src_ptr + n, tl.load(slot_to_expert_ptr + s))
+            tl.store(res_present_ptr + s, 0)
+            n += 1
+    tl.store(act_count_ptr, n)
+
+
+@triton.jit
+def _expand_csf_fixed_kernel(
+    w1_fixed_ptr,
+    w2_fixed_ptr,
+    w1_out_ptr,
+    w2_out_ptr,
+    w1_lut_ptr,
+    w2_lut_ptr,
+    act_dst_ptr,
+    act_count_ptr,
+    R1: tl.constexpr,
+    C1: tl.constexpr,
+    R2: tl.constexpr,
+    C2: tl.constexpr,
+    A16_LAYOUT: tl.constexpr,
+    USE_LUT: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+):
+    """Expand rank-local legacy NVFP4 CSF fixed slabs for active HBM slots into shared scale_scratch.
+
+    Each 16-row slab stores 16 base bytes followed by 16 * (C // 2) packed 4-bit offset bytes.
+    Supports both a4 (F8_128x4 swizzled) and a16 (packed MMA scale layout + 256-entry value LUT).
+    """
+    n_act = tl.load(act_count_ptr)
+    if n_act <= 0:
+        return
+    slabs1: tl.constexpr = R1 // 16
+    slabs2: tl.constexpr = R2 // 16
+    tiles2: tl.constexpr = slabs2 // 4
+    tiles_per_slot: tl.constexpr = slabs1 + tiles2
+    half_c1: tl.constexpr = C1 // 2
+    half_c2: tl.constexpr = C2 // 2
+    stride1: tl.constexpr = 16 * (1 + half_c1)
+    stride2: tl.constexpr = 16 * (1 + half_c2)
+    fixed_row1: tl.constexpr = slabs1 * stride1
+    fixed_row2: tl.constexpr = slabs2 * stride2
+    out_row1: tl.constexpr = R1 * C1
+    out_row2: tl.constexpr = R2 * C2
+    slab1_elems: tl.constexpr = 16 * C1
+    slab2_elems: tl.constexpr = 16 * C2
+
+    total_tiles = n_act * tiles_per_slot
+    pid = tl.program_id(0)
+    t = pid
+    offs512 = tl.arange(0, 512)
+    while t < total_tiles:
+        a_idx = t // tiles_per_slot
+        local_t = t - a_idx * tiles_per_slot
+        slot = tl.load(act_dst_ptr + a_idx).to(tl.int64)
+        if local_t < slabs1:
+            slab = local_t
+            s_base = slot * fixed_row1 + slab * stride1
+            o_base = slot * out_row1
+            for b in tl.static_range(0, (slab1_elems + 511) // 512):
+                elem = b * 512 + offs512
+                mask = elem < slab1_elems
+                rl = elem // C1
+                c = elem - rl * C1
+                r = slab * 16 + rl
+                base = tl.load(w1_fixed_ptr + s_base + rl, mask=mask, other=0).to(tl.int32)
+                packed = tl.load(
+                    w1_fixed_ptr + s_base + 16 + rl * half_c1 + (c // 2),
+                    mask=mask,
+                    other=0,
+                ).to(tl.int32)
+                code = (packed >> ((c & 1) * 4)) & 0xF
+                val = (base + code) & 0xFF
+                if USE_LUT:
+                    val = tl.load(w1_lut_ptr + val, mask=mask, other=0).to(tl.int32)
+                if A16_LAYOUT:
+                    r64 = r % 64
+                    q = r64 // 8
+                    inv = (r64 % 8) * 8 + (q // 4) * 4 + ((q % 2) * 2 + ((q % 4) // 2))
+                    dst_off = c * R1 + (r // 64) * 64 + inv
+                else:
+                    dst_off = (
+                        (r // 128) * (128 * C1)
+                        + (c // 4) * 512
+                        + (r % 32) * 16
+                        + ((r % 128) // 32) * 4
+                        + (c % 4)
+                    )
+                tl.store(w1_out_ptr + o_base + dst_off, val.to(tl.uint8), mask=mask)
+        else:
+            tile2 = local_t - slabs1
+            o_base = slot * out_row2
+            for j in tl.static_range(0, 4):
+                slab = tile2 * 4 + j
+                s_base = slot * fixed_row2 + slab * stride2
+                elem = offs512
+                mask = elem < slab2_elems
+                rl = elem // C2
+                c = elem - rl * C2
+                r = slab * 16 + rl
+                base = tl.load(w2_fixed_ptr + s_base + rl, mask=mask, other=0).to(tl.int32)
+                packed = tl.load(
+                    w2_fixed_ptr + s_base + 16 + rl * half_c2 + (c // 2),
+                    mask=mask,
+                    other=0,
+                ).to(tl.int32)
+                code = (packed >> ((c & 1) * 4)) & 0xF
+                val = (base + code) & 0xFF
+                if USE_LUT:
+                    val = tl.load(w2_lut_ptr + val, mask=mask, other=0).to(tl.int32)
+                if A16_LAYOUT:
+                    r64 = r % 64
+                    q = r64 // 8
+                    inv = (r64 % 8) * 8 + (q // 4) * 4 + ((q % 2) * 2 + ((q % 4) // 2))
+                    dst_off = c * R2 + (r // 64) * 64 + inv
+                else:
+                    dst_off = (
+                        (r // 128) * (128 * C2)
+                        + (c // 4) * 512
+                        + (r % 32) * 16
+                        + ((r % 128) // 32) * 4
+                        + (c % 4)
+                    )
+                tl.store(w2_out_ptr + o_base + dst_off, val.to(tl.uint8), mask=mask)
+        t += NUM_CTAS
+
+
+@triton.jit
+def _scatter_csf_exc_kernel(
+    w1_exc_ptr,
+    w1_starts_ptr,
+    w2_exc_ptr,
+    w2_starts_ptr,
+    w1_out_ptr,
+    w2_out_ptr,
+    act_src_ptr,
+    act_dst_ptr,
+    act_count_ptr,
+    OUT_ROW1: tl.constexpr,
+    OUT_ROW2: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+):
+    """Scatter pre-swizzled CSF exception bytes ((val << 24) | dst_off) for active experts."""
+    n_act = tl.load(act_count_ptr)
+    if n_act <= 0:
+        return
+    pid = tl.program_id(0)
+    offs = tl.arange(0, 256)
+    a = pid
+    while a < n_act:
+        slot = tl.load(act_dst_ptr + a).to(tl.int64)
+        e = tl.load(act_src_ptr + a).to(tl.int64)
+        lo1 = tl.load(w1_starts_ptr + e)
+        hi1 = tl.load(w1_starts_ptr + e + 1)
+        o_base1 = slot * OUT_ROW1
+        k = lo1
+        while k < hi1:
+            idx = k + offs
+            m = idx < hi1
+            word = tl.load(w1_exc_ptr + idx, mask=m, other=0, cache_modifier=".cg").to(tl.uint32)
+            dst_off = (word & 0xFFFFFF).to(tl.int64)
+            val = ((word >> 24) & 0xFF).to(tl.uint8)
+            tl.store(w1_out_ptr + o_base1 + dst_off, val, mask=m)
+            k += 256
+        lo2 = tl.load(w2_starts_ptr + e)
+        hi2 = tl.load(w2_starts_ptr + e + 1)
+        o_base2 = slot * OUT_ROW2
+        k = lo2
+        while k < hi2:
+            idx = k + offs
+            m = idx < hi2
+            word = tl.load(w2_exc_ptr + idx, mask=m, other=0, cache_modifier=".cg").to(tl.uint32)
+            dst_off = (word & 0xFFFFFF).to(tl.int64)
+            val = ((word >> 24) & 0xFF).to(tl.uint8)
+            tl.store(w2_out_ptr + o_base2 + dst_off, val, mask=m)
+            k += 256
+        a += NUM_CTAS
 
 
 @triton.jit
@@ -416,20 +629,113 @@ class ExpertPlanePair:
     row_bytes: int
 
 
+@dataclass(frozen=True)
+class CsfScaleSpec:
+    """Rank-local CSF fixed slabs (HBM) + pre-swizzled exceptions (MappedHost) -> shared scale_scratch."""
+
+    w1_fixed_hbm: torch.Tensor
+    w2_fixed_hbm: torch.Tensor
+    w1_exc_dev: torch.Tensor
+    w1_starts: torch.Tensor
+    w2_exc_dev: torch.Tensor
+    w2_starts: torch.Tensor
+    w1_scratch: torch.Tensor
+    w2_scratch: torch.Tensor
+    r1: int
+    c1: int
+    r2: int
+    c2: int
+    a16_layout: bool = False
+    w1_lut: torch.Tensor | None = None
+    w2_lut: torch.Tensor | None = None
+
+
+class PreparedCsfScaleExpander:
+    """CUDA-graph-capturable active-slot CSF scale expander into shared HBM scale_scratch."""
+
+    def __init__(
+        self,
+        spec: CsfScaleSpec,
+        act_src: torch.Tensor,
+        act_dst: torch.Tensor,
+        act_count: torch.Tensor,
+        *,
+        expand_ctas: int = DEFAULT_EXPAND_CTAS,
+        scatter_ctas: int = DEFAULT_SCATTER_CTAS,
+    ):
+        self.spec = spec
+        use_lut = int(spec.w1_lut is not None and spec.w2_lut is not None)
+        w1_fixed_u8 = spec.w1_fixed_hbm.view(torch.uint8).reshape(-1)
+        w2_fixed_u8 = spec.w2_fixed_hbm.view(torch.uint8).reshape(-1)
+        w1_out_u8 = spec.w1_scratch.view(torch.uint8).reshape(-1)
+        w2_out_u8 = spec.w2_scratch.view(torch.uint8).reshape(-1)
+        w1_lut = spec.w1_lut if use_lut else w1_fixed_u8
+        w2_lut = spec.w2_lut if use_lut else w2_fixed_u8
+        self._expand = prepare_triton(
+            _expand_csf_fixed_kernel,
+            (
+                w1_fixed_u8,
+                w2_fixed_u8,
+                w1_out_u8,
+                w2_out_u8,
+                w1_lut,
+                w2_lut,
+                act_dst,
+                act_count,
+                spec.r1,
+                spec.c1,
+                spec.r2,
+                spec.c2,
+                int(spec.a16_layout),
+                use_lut,
+                expand_ctas,
+            ),
+            (expand_ctas, 1, 1),
+            num_warps=4,
+        )
+        self._scatter = prepare_triton(
+            _scatter_csf_exc_kernel,
+            (
+                spec.w1_exc_dev.view(torch.uint32).reshape(-1),
+                spec.w1_starts.view(torch.int64).reshape(-1),
+                spec.w2_exc_dev.view(torch.uint32).reshape(-1),
+                spec.w2_starts.view(torch.int64).reshape(-1),
+                w1_out_u8,
+                w2_out_u8,
+                act_src,
+                act_dst,
+                act_count,
+                spec.r1 * spec.c1,
+                spec.r2 * spec.c2,
+                scatter_ctas,
+            ),
+            (scatter_ctas, 1, 1),
+            num_warps=4,
+        )
+
+    def __call__(self) -> None:
+        self._expand()
+        self._scatter()
+
+
 def collect_expert_planes(
     hbm_experts,
     host_planes: dict[str, torch.Tensor],
+    *,
+    csf_hbm_planes: dict[str, torch.Tensor] | None = None,
 ) -> tuple[tuple[ExpertPlanePair, ...], tuple[ExpertPlanePair, ...]]:
     """Return (bulk_planes, scalar_planes) pairing HBM PreparedExperts tensors with MappedHost views.
 
     Deduplicates aliases by HBM data_ptr() so shared views (e.g. w13_scale aliasing w1_blockscale)
-    are copied exactly once.
+    are copied exactly once. When ``csf_hbm_planes`` is provided, uncompressed block-scale views
+    are skipped (they alias shared scale_scratch) and replaced by the compressed CSF fixed planes.
     """
     impl = hbm_experts._impl if hasattr(hbm_experts, "_impl") else hbm_experts
     num_slots = int(hbm_experts.num_experts)
     seen_ptrs: set[int] = set()
     bulk: list[ExpertPlanePair] = []
     scalars: list[ExpertPlanePair] = []
+    skip_raw_scales = csf_hbm_planes is not None
 
     def register(name: str, dst: torch.Tensor | None):
         if dst is None or not isinstance(dst, torch.Tensor):
@@ -459,21 +765,36 @@ def collect_expert_planes(
         else:
             bulk.append(pair)
 
-    for field in (
-        "w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
-        "w1_alphas", "w2_alphas", "a1_gscale", "a2_gscale",
-    ):
+    impl_fields = (
+        ("w1_fp4", "w2_fp4", "w1_alphas", "w2_alphas", "a1_gscale", "a2_gscale")
+        if skip_raw_scales
+        else (
+            "w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
+            "w1_alphas", "w2_alphas", "a1_gscale", "a2_gscale",
+        )
+    )
+    for field in impl_fields:
         register(field, getattr(impl, field, None))
+
+    if csf_hbm_planes is not None:
+        for field in ("w1_csf_fixed", "w2_csf_fixed"):
+            if field in csf_hbm_planes:
+                register(field, csf_hbm_planes[field])
 
     representation = getattr(impl, "representation", None)
     if representation is not None:
         rep_val = getattr(representation, "value", representation)
-        for field in (
-            "w13_scale", "w2_scale", "w13_sfb", "w2_sfb",
-            "w13_global_scale", "w2_global_scale",
-            "micro_w13_scale", "micro_w2_scale",
-            "micro_w13_global_scale", "micro_w2_global_scale",
-        ):
+        rep_fields = (
+            ("w13_global_scale", "w2_global_scale", "micro_w13_global_scale", "micro_w2_global_scale")
+            if skip_raw_scales
+            else (
+                "w13_scale", "w2_scale", "w13_sfb", "w2_sfb",
+                "w13_global_scale", "w2_global_scale",
+                "micro_w13_scale", "micro_w2_scale",
+                "micro_w13_global_scale", "micro_w2_global_scale",
+            )
+        )
+        for field in rep_fields:
             register(field, getattr(rep_val, field, None))
 
     if not bulk:
@@ -592,6 +913,8 @@ class PreparedExpertCache:
         staging_bulk_planes: Sequence[ExpertPlanePair] = (),
         staging_scalar_planes: Sequence[ExpertPlanePair] = (),
         staging_slots: int = 0,
+        csf_spec: CsfScaleSpec | None = None,
+        staging_csf_spec: CsfScaleSpec | None = None,
     ):
         if tokens <= 0 or top_k <= 0:
             raise ValueError("tokens and top_k must be positive")
@@ -612,6 +935,7 @@ class PreparedExpertCache:
         self.staging_slots = staging_slots if handle_overflow else 0
         self.device = state.device
         self.max_misses = min(routes, state.num_slots) if update_cache else 0
+        emit_active = csf_spec is not None
 
         # Persistent per-shape scratch buffers for miss list (tiny: <= 1 KiB).
         self.miss_src = persistent_zeros((max(1, self.max_misses),), torch.int32, self.device)
@@ -623,6 +947,11 @@ class PreparedExpertCache:
         self.ovf_src = persistent_zeros((ovf_cap,), torch.int32, self.device)
         self.ovf_dst = persistent_zeros((ovf_cap,), torch.int32, self.device)
         self.ovf_count = persistent_zeros((1,), torch.int32, self.device)
+
+        act_cap = state.num_slots if emit_active else 1
+        self.act_src = persistent_zeros((act_cap,), torch.int32, self.device)
+        self.act_dst = persistent_zeros((act_cap,), torch.int32, self.device)
+        self.act_count = persistent_zeros((1,), torch.int32, self.device)
 
         s_pow2 = max(16, triton.next_power_of_2(state.num_slots))
         # Tiny 16-element aligned stubs give identical Triton specialization without allocating [tokens, top_k].
@@ -647,6 +976,9 @@ class PreparedExpertCache:
                 self.ovf_src,
                 self.ovf_dst,
                 self.ovf_count,
+                self.act_src,
+                self.act_dst,
+                self.act_count,
                 routes,
                 state.num_experts,
                 state.num_slots,
@@ -657,6 +989,7 @@ class PreparedExpertCache:
                 ovf_pow2,
                 int(update_cache),
                 int(handle_overflow),
+                int(emit_active),
             ),
             (1, 1, 1),
             num_warps=1,
@@ -747,6 +1080,14 @@ class PreparedExpertCache:
             )
             if handle_overflow else ([], [])
         )
+        self._csf_expander = (
+            PreparedCsfScaleExpander(csf_spec, self.act_src, self.act_dst, self.act_count)
+            if csf_spec is not None else None
+        )
+        self._ovf_csf_expander = (
+            PreparedCsfScaleExpander(staging_csf_spec, self.ovf_src, self.ovf_dst, self.ovf_count)
+            if handle_overflow and staging_csf_spec is not None else None
+        )
 
     def __call__(
         self,
@@ -774,6 +1115,8 @@ class PreparedExpertCache:
             op()
         for op in self._scalar_copies:
             op()
+        if self._csf_expander is not None:
+            self._csf_expander()
         if self.has_overflow:
             for op in self._ovf_bulk_copies:
                 op()
@@ -781,6 +1124,11 @@ class PreparedExpertCache:
                 op()
             return mapped_ids, ovf_ids
         return mapped_ids
+
+    def expand_overflow(self) -> None:
+        """Expand CSF scales for staged overflow slots into shared scale_scratch after resident MoE finishes."""
+        if self._ovf_csf_expander is not None:
+            self._ovf_csf_expander()
 
 
 class PreparedPrefillExpertStreamer:
@@ -803,6 +1151,8 @@ class PreparedPrefillExpertStreamer:
         hidden_size: int,
         staging_slots: int = 64,
         copy_ctas: int = DEFAULT_COPY_CTAS,
+        csf_spec: CsfScaleSpec | None = None,
+        staging_csf_spec: CsfScaleSpec | None = None,
     ):
         if tokens <= 0 or top_k <= 0 or staging_slots <= 0:
             raise ValueError("tokens, top_k, and staging_slots must be positive")
@@ -820,17 +1170,41 @@ class PreparedPrefillExpertStreamer:
         self.miss_dst = persistent_zeros((staging_slots,), torch.int32, self.device)
         self.miss_count = persistent_zeros((1,), torch.int32, self.device)
 
+        emit_res_csf = csf_spec is not None
+        res_cap = state.num_slots if emit_res_csf else 1
+        self.res_present = persistent_zeros((res_cap,), torch.int32, self.device)
+        self.res_src = persistent_zeros((res_cap,), torch.int32, self.device)
+        self.res_dst = persistent_zeros((res_cap,), torch.int32, self.device)
+        self.res_count = persistent_zeros((1,), torch.int32, self.device)
+
         # Tiny 16-element aligned stubs give identical Triton specialization without retaining [tokens, hidden] tensors.
         stub_i32 = torch.empty((16,), dtype=torch.int32, device=self.device)
         stub_bf16 = torch.empty((16,), dtype=torch.bfloat16, device=self.device)
 
         self._map_resident = prepare_triton(
             _prefill_resident_ids_kernel,
-            (stub_i32, stub_i32, state.expert_to_slot, self.routes, state.num_experts, 256),
+            (stub_i32, stub_i32, state.expert_to_slot, self.res_present, self.routes, state.num_experts, int(emit_res_csf), 256),
             (triton.cdiv(self.routes, 256), 1, 1),
             num_warps=4,
         )
         self._map_resident.args = (None, None, *self._map_resident.args[2:])
+        self._res_compact = (
+            prepare_triton(
+                _prefill_resident_compact_kernel,
+                (self.res_present, state.slot_to_expert, self.res_src, self.res_dst, self.res_count, state.num_slots),
+                (1, 1, 1),
+                num_warps=1,
+            )
+            if emit_res_csf else None
+        )
+        self._res_csf_expander = (
+            PreparedCsfScaleExpander(csf_spec, self.res_src, self.res_dst, self.res_count)
+            if emit_res_csf else None
+        )
+        self._stg_csf_expander = (
+            PreparedCsfScaleExpander(staging_csf_spec, self.miss_src, self.miss_dst, self.miss_count)
+            if staging_csf_spec is not None else None
+        )
 
         self._slice_maps = []
         self._slice_compacts = []
@@ -944,6 +1318,10 @@ class PreparedPrefillExpertStreamer:
             self._map_resident.grid,
             **self._map_resident.options,
         )
+        if self._res_compact is not None:
+            self._res_compact()
+        if self._res_csf_expander is not None:
+            self._res_csf_expander()
         return mapped_ids
 
     def stage_slice(self, pass_idx: int, ids: torch.Tensor, slice_ids: torch.Tensor) -> torch.Tensor:
@@ -954,6 +1332,8 @@ class PreparedPrefillExpertStreamer:
             op()
         for op in self._scalar_copies:
             op()
+        if self._stg_csf_expander is not None:
+            self._stg_csf_expander()
         return slice_ids
 
     def accumulate(self, acc: torch.Tensor, delta: torch.Tensor) -> None:

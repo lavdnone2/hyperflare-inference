@@ -109,11 +109,14 @@ class PreparationConfig:
     stream_overlap: bool = True
     shard_hyperconnections: bool = False
     expert_slots: str | int | None = None
+    expert_scale_compression: str | None = None
     vision_in_ram: bool = False
     embed_in_ram: bool = False
     mtp_only: bool = False
 
     def __post_init__(self):
+        if self.expert_scale_compression not in (None, "csf"):
+            raise ValueError("expert_scale_compression must be None or 'csf'")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -248,6 +251,7 @@ def _identity(manifest, world_size=1, *, config=None, draft_config=None):
             force_moe_decode_a16=config.force_moe_decode_a16,
             shard_hyperconnections=config.shard_hyperconnections,
             expert_slots=str(config.expert_slots) if config.expert_slots is not None else None,
+            expert_scale_compression=config.expert_scale_compression,
             vision_in_ram=config.vision_in_ram,
             embed_in_ram=config.embed_in_ram)
         value["draft"] = None
@@ -315,11 +319,18 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     # closing a dedicated load transient pool returns those segments to CUDA immediately before
     # collectives, scratch, and kernel tuning.
     host_allocator = None if core_storage is None else core_storage.host_allocate
+    share_mxfp8_head = bool(
+        config.online_mxfp8
+        and config.draft_head_quantization == "mxfp8"
+        and config.expert_slots is not None
+    )
     with (contextlib.nullcontext() if core_storage is None else core_storage.transient()):
         weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
             shard_hyperconnections=config.shard_hyperconnections,
             force_moe_decode_a16=config.force_moe_decode_a16,
             expert_slots=config.expert_slots,
+            expert_scale_compression=config.expert_scale_compression,
+            quantize_lm_head_mxfp8=share_mxfp8_head,
             vision_in_ram=config.vision_in_ram,
             embed_in_ram=config.embed_in_ram,
             host_allocator=host_allocator)
@@ -353,7 +364,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 embed_in_ram=config.embed_in_ram,
                 host_allocator=host_allocator,
             )
-            if config.draft_head_quantization is not None:
+            if config.draft_head_quantization is not None and not share_mxfp8_head:
                 from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 
                 head = weights.tree.lm_head.weight
@@ -402,16 +413,19 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,
                    "shard_hyperconnections": config.shard_hyperconnections,
-                   "force_moe_decode_a16": config.force_moe_decode_a16,
+                   "force_moe_decode_a16": False,
                    "vision_in_ram": config.vision_in_ram,
                    "embed_in_ram": config.embed_in_ram,
                    "speculative_method": "dflash2",
-                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": None},
+                   "online_mxfp8": False, "draft_head_quantization": None},
         headroom_bytes=(0 if config.expert_slots is not None else config.headroom_bytes),
         benchmark_storage=core_storage)
     session._forward_namespace_extra = (
         config.speculative_method,
         config.draft_head_quantization,
+        config.online_mxfp8,
+        config.force_moe_decode_a16,
+        config.expert_scale_compression,
         str(config.expert_slots) if config.expert_slots is not None else None,
     )
     session.__enter__()
@@ -604,10 +618,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 for capacity in reversed(config.batch_capacities):
                     name = f"resume{capacity}" + suffix
                     resume = PreparedResume(inputs, requests, state, scratch.sample_hidden[:capacity],
-                        scratch.logits[:capacity], weights.tree.lm_head.weight, completion, frame, sequence,
+                        scratch.logits[:capacity], weights.head_weight, completion, frame, sequence,
                         session=session, name=name, vocabulary_runtime=vocabulary_collective,
                         local_logits=None if scratch.local_logits is None else scratch.local_logits[:capacity],
-                        coordinator=coordinator, sampling_workspace=sampling_workspace)
+                        coordinator=coordinator, sampling_workspace=sampling_workspace, workspace=workspaces)
                     resume.functional(session=session)
                     forward = speculation.resume(resume) if enabled else resume
                     add(name, forward, "resume", capacity, 1, forward_fields, enabled=enabled)
@@ -751,11 +765,17 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
         from .export import disposable_ranges
 
-        export_zero_ranges = disposable_ranges(cache=final_cache, staging_experts=weights.prefill_staging_experts)
+        export_zero_ranges = disposable_ranges(
+            cache=final_cache,
+            staging_experts=weights.prefill_staging_experts,
+            staging_csf=weights.prefill_staging_csf,
+            shared_scale_scratch=weights.shared_scale_scratch,
+        )
         return PreparedModel(rebuild_weights=declare_weights({'weights': weights, 'mtp': mtp_weights, 'draft': draft_weights, 'draft_head': draft_head}, components={
         'tree.model.language_model.embed_tokens': 'embedding',
         'tree.model.language_model.hyper_connection_mixer': 'hyper-connection',
         'tree.lm_head': 'head',
+        'lm_head_quantized': 'head',
         'vision': 'vision',
         'mtp': 'mtp',
         'draft': 'draft',
