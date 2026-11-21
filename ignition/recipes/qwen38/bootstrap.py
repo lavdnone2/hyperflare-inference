@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 
 import torch
@@ -265,6 +265,128 @@ def _identity(manifest, world_size=1, *, config=None, draft_config=None):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _align256(n: int) -> int:
+    return (n + 255) & ~255
+
+
+def _collect_meta_storages(obj, seen: dict[int, int]) -> list[tuple[int, int]]:
+    added: list[tuple[int, int]] = []
+
+    def walk(v):
+        if isinstance(v, torch.Tensor):
+            st = v.untyped_storage()
+            nb = int(st.nbytes())
+            if nb == 0:
+                return
+            key = st._cdata
+            if key not in seen:
+                seen[key] = -1
+                added.append((key, nb))
+        elif is_dataclass(v) and not isinstance(v, type):
+            for f in fields(v):
+                walk(getattr(v, f.name))
+        elif isinstance(v, dict):
+            for val in v.values():
+                walk(val)
+        elif isinstance(v, (tuple, list)):
+            for val in v:
+                walk(val)
+
+    walk(obj)
+    return added
+
+
+def _rebind_meta_from_slab(obj, slab: torch.Tensor, offsets: dict[int, int]):
+    def walk(v):
+        if isinstance(v, torch.Tensor):
+            st = v.untyped_storage()
+            nb = int(st.nbytes())
+            if nb == 0:
+                return torch.empty_strided(tuple(v.shape), tuple(v.stride()), dtype=v.dtype, device=slab.device)
+            base_bytes = offsets[st._cdata]
+            elem_off = base_bytes // v.element_size() + v.storage_offset()
+            return torch.empty(0, dtype=v.dtype, device=slab.device).set_(
+                slab.untyped_storage(), elem_off, tuple(v.shape), tuple(v.stride())
+            )
+        if is_dataclass(v) and not isinstance(v, type):
+            return type(v)(**{f.name: walk(getattr(v, f.name)) for f in fields(v)})
+        if isinstance(v, dict):
+            return {k: walk(val) for k, val in v.items()}
+        if isinstance(v, tuple):
+            return tuple(walk(val) for val in v)
+        if isinstance(v, list):
+            return [walk(val) for val in v]
+        return v
+
+    return walk(obj)
+
+
+def _allocate_shared_prep_scratch(
+    tokens: int,
+    device,
+    *,
+    sample_rows: int,
+    world_size: int,
+    hyperconnection_lowrank: int,
+    vision_patches: int = 16384,
+):
+    """Allocate preparation-only DecoderScratch and VisionScratch backed by one shared transient slab.
+
+    Decoder and vision graphs are compiled as functional forwards and never share operators or run
+    concurrently during preparation; mutually exclusive layer branches (PLE/GDN/QSA/MoE) and vision
+    phases reuse disjoint sub-ranges while preserving exact intra-operator aliasing and strides.
+    """
+    meta = torch.device("meta")
+    ds_meta = DecoderScratch.allocate(
+        tokens, meta, sample_rows=sample_rows, world_size=world_size,
+        hyperconnection_lowrank=hyperconnection_lowrank,
+    )
+    vs_meta = VisionScratch.allocate(vision_patches, meta)
+
+    d_offsets: dict[int, int] = {}
+    cur = 0
+    for core_obj in (
+        ds_meta.embedding, ds_meta.residual, ds_meta.hidden, ds_meta.sample_hidden,
+        ds_meta.logits, ds_meta.local_logits, ds_meta.hyperconnection, ds_meta.gdn.output,
+    ):
+        for sid, nb in _collect_meta_storages(core_obj, d_offsets):
+            d_offsets[sid] = cur
+            cur = _align256(cur + nb)
+    core_end = cur
+    d_peak = core_end
+    for branch in (ds_meta.ple, ds_meta.gdn, ds_meta.qsa, ds_meta.moe):
+        b_cur = core_end
+        for sid, nb in _collect_meta_storages(branch, d_offsets):
+            d_offsets[sid] = b_cur
+            b_cur = _align256(b_cur + nb)
+        d_peak = max(d_peak, b_cur)
+
+    v_offsets: dict[int, int] = {}
+    v_cur = 0
+    for core_t in (vs_meta.hidden, vs_meta.attention, vs_meta.projected):
+        for sid, nb in _collect_meta_storages(core_t, v_offsets):
+            v_offsets[sid] = v_cur
+            v_cur = _align256(v_cur + nb)
+    v_core_end = v_cur
+    v_peak = v_core_end
+    for group in (
+        (vs_meta.patches, vs_meta.merger_intermediate, vs_meta.output),
+        (vs_meta.qkv,),
+        (vs_meta.query, vs_meta.key, vs_meta.value),
+        (vs_meta.intermediate,),
+    ):
+        g_cur = v_core_end
+        for sid, nb in _collect_meta_storages(group, v_offsets):
+            v_offsets[sid] = g_cur
+            g_cur = _align256(g_cur + nb)
+        v_peak = max(v_peak, g_cur)
+
+    slab = torch.zeros((max(d_peak, v_peak),), dtype=torch.uint8, device=device)
+    ds = _rebind_meta_from_slab(ds_meta, slab, d_offsets)
+    vs = _rebind_meta_from_slab(vs_meta, slab, v_offsets)
+    return ds, vs, slab
+
+
 def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None):
     return prepare_model(snapshot, config, progress=progress, compile_decoder=config.compile_decoder,
                          rank=rank, group=group, core_storage=core_storage)
@@ -450,9 +572,11 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             requests = DeviceRequestState.allocate(device, capacity=slots)
             sampling_workspace = None
             inputs = DecoderInputs.allocate(device, context=config.context, tokens=config.token_capacity, capacity=slots)
-            scratch = DecoderScratch.allocate(config.token_capacity, device, sample_rows=sample_rows,
+            scratch, vision_root, prep_scratch_slab = _allocate_shared_prep_scratch(
+                config.token_capacity, device, sample_rows=sample_rows,
                 world_size=shard.world_size,
-                hyperconnection_lowrank=320 // shard.world_size if config.shard_hyperconnections else 320)
+                hyperconnection_lowrank=320 // shard.world_size if config.shard_hyperconnections else 320,
+            )
             workspaces = ScratchArena(device, overlap=config.stream_overlap)
             rotary = RotaryTables.allocate(weights.tree.config.text_config, config.context, device)
             cache = {index: QSAState.allocate(pages=1, slots=slots + 1, device=device, draft_tokens=speculative_tokens, kv_heads=max(1, 2 // shard.world_size))
@@ -517,7 +641,6 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 stage.update(advance=1)
 
             vision_fields = (*vision_inputs.__dataclass_fields__, "vision_feature_slot")
-            vision_root = VisionScratch.allocate(16384, device)
             for capacity in (16384, 4096, 1024, 256):
                 s = vision_scratch[capacity] = vision_root.rows(capacity)
                 handoff = PreparedVisionHandoff(vision_inputs, features, requests, s.output, completion, frame, sequence,
@@ -651,7 +774,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         with phase(progress, "Prepare and tune kernels") as stage, transient:
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
         workspaces.release_preparation()
-        scratch = s = vision_root = None
+        scratch = s = vision_root = prep_scratch_slab = None
         vision_scratch.clear()
         if config.mixed_shapes:
             owners.remove(mixed_scratch)
