@@ -71,7 +71,11 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     graphs, compiled = {}, {}
     warmup = nullcontext if warmup_storage is None else warmup_storage.transient
     if compile_decoder:
-        cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
+        fwd_ns = session.namespace.to_dict()
+        fwd_extra = getattr(session, "_forward_namespace_extra", None)
+        if fwd_extra is not None:
+            fwd_ns = {**fwd_ns, "forward_extra": fwd_extra}
+        cache = ForwardCache(namespace=fwd_ns, device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
                              compile_workers=getattr(session, "requested_compile_workers", None),
                              lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)

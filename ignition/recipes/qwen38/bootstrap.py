@@ -405,10 +405,15 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    "force_moe_decode_a16": config.force_moe_decode_a16,
                    "vision_in_ram": config.vision_in_ram,
                    "embed_in_ram": config.embed_in_ram,
-                   "speculative_method": config.speculative_method,
-                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization},
+                   "speculative_method": "dflash2",
+                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": None},
         headroom_bytes=(0 if config.expert_slots is not None else config.headroom_bytes),
         benchmark_storage=core_storage)
+    session._forward_namespace_extra = (
+        config.speculative_method,
+        config.draft_head_quantization,
+        str(config.expert_slots) if config.expert_slots is not None else None,
+    )
     session.__enter__()
     graphs = {}
     try:
