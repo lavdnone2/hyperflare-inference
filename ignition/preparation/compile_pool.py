@@ -57,8 +57,9 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
         capacity = min(8, capacity)
     if shared:
         available = min(available, free)
+    worker_host_bytes = (10 << 30) if (not shared and props.total_memory <= (20 << 30)) else host_memory.FORWARD_WORKER_BYTES
     return CompilerResources(capacity, available, limit,
-        host_memory.FORWARD_WORKER_BYTES + (device_bytes if shared else 0),
+        worker_host_bytes + (device_bytes if shared else 0),
         max(host_memory._HEADROOM_BYTES, headroom_bytes if shared else 0))
 
 
@@ -86,8 +87,7 @@ def allocate_workers(resources, counts, hosts):
             # Small forwards can fit below the concurrency estimate. Preserve one worker per host
             # under the minimum allowance without multiplying that allowance by the rank count.
             able = [rank for rank in members if resources[rank].capacity
-                    and resources[rank].worker_bytes - host_memory.FORWARD_WORKER_BYTES
-                    + host_memory._WORKER_BYTES <= remaining]
+                    and min(resources[rank].worker_bytes, host_memory._WORKER_BYTES) <= remaining]
             if able:
                 workers[able[0]] = 1
             else:

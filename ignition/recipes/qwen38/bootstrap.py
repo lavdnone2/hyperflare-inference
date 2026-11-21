@@ -829,8 +829,12 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             nonlocal final_cache
             with phase(progress, "Allocate preparation KV cache"):
                 free = minimum_across_ranks(device_memory_info(device)[0], group)
-                if page_capacity * page_bytes + config.headroom_bytes > free:
-                    raise MemoryError("insufficient memory for preparation KV pages and configured headroom")
+                kv_headroom = (128 << 20) if config.expert_slots is not None else config.headroom_bytes
+                if page_capacity * page_bytes + kv_headroom > free:
+                    raise MemoryError(
+                        f"insufficient memory for preparation KV pages and configured headroom "
+                        f"(need {(page_capacity * page_bytes + kv_headroom) / (1 << 20):.1f} MiB, free {free / (1 << 20):.1f} MiB)"
+                    )
                 if core_storage is not None:
                     final_cache = {index: value.resize_pages_for_preparation(planned_pages, storage=core_storage,
                         prefix=f"kv-{index}-", backed_pages=page_capacity) for index, value in cache.items()}
